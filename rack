@@ -1,0 +1,1122 @@
+#!/usr/bin/env bash
+# rack — download, install, and remove GitHub binaries/archives by name
+# Usage:
+#   rack [-a] <name> <url|slug>   Install a binary (full URL, owner/repo, or repo name)
+#   rack -u <name> [url|slug]     Update a managed binary (optionally from new URL or slug)
+#   rack -r <name> <index>        Roll back to a previously recorded URL
+#   rack -H <name>                Show URL history for a managed binary
+#   rack -R <name>                Remove a previously installed binary
+#   rack -l                       List all managed installs
+#   rack update                   Check for and apply updates for all managed installs
+
+set -euo pipefail
+
+INSTALL_DIR="${RACK_DIR:-$HOME/.local/bin}"
+REGISTRY="${RACK_REGISTRY:-$HOME/.local/share/rack/registry.tsv}"
+HISTORY="${RACK_HISTORY:-$HOME/.local/share/rack/history.tsv}"
+
+# ── colors & formatting ───────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  BOLD="\033[1m"
+  DIM="\033[2m"
+  GREEN="\033[1;32m"
+  YELLOW="\033[1;33m"
+  CYAN="\033[1;36m"
+  RED="\033[1;31m"
+  RESET="\033[0m"
+else
+  BOLD="" DIM="" GREEN="" YELLOW="" CYAN="" RED="" RESET=""
+fi
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+usage() {
+  echo -e "${BOLD}rack${RESET} — install and remove GitHub binaries by name"
+  echo ""
+  echo -e "${BOLD}Usage:${RESET}"
+  echo -e "  rack ${CYAN}[-a]${RESET} ${CYAN}<name> <url|slug>${RESET}  Download and install a binary"
+  echo -e "  rack ${CYAN}-u${RESET} ${CYAN}<name> [url|slug]${RESET} Update a managed binary (optionally from new URL or slug)"
+  echo -e "  rack ${CYAN}-r${RESET} ${CYAN}<name> <index>${RESET}   Roll back to a previously recorded URL"
+  echo -e "  rack ${CYAN}-H${RESET} ${CYAN}<name>${RESET}           Show URL history for a managed binary"
+  echo -e "  rack ${CYAN}-R${RESET} ${CYAN}<name>${RESET}            Remove a managed install"
+  echo -e "  rack ${CYAN}-l${RESET}                    List all managed installs"
+  echo -e "  rack ${CYAN}update${RESET}               Check for and apply updates for all managed installs"
+  echo ""
+  echo -e "${BOLD}Flags:${RESET}"
+  echo -e "  ${CYAN}-a${RESET}   Extract archive and find binary named <name> inside"
+  echo -e "  ${CYAN}-u${RESET}   Update binary from its recorded source URL (or a new one)"
+  echo -e "  ${CYAN}-r${RESET}   Roll back to a URL from history by index (see rack -H <name>)"
+  echo -e "  ${CYAN}-H${RESET}   Show numbered URL history for a binary"
+  echo -e "  ${CYAN}-R${RESET}   Remove the named binary from the install dir"
+  echo -e "  ${CYAN}-l${RESET}   List everything managed by rack"
+  echo ""
+  echo -e "  Supported archives: .tar.gz  .tgz  .tar.bz2  .tar.xz  .zip"
+  echo -e "  GitHub slugs:  ${DIM}owner/repo${RESET}  ${DIM}(resolves latest release)${RESET}"
+  echo -e "                 ${DIM}repo-name${RESET}    ${DIM}(searches GitHub, then resolves)${RESET}"
+  echo -e "  Install dir:   ${DIM}${INSTALL_DIR}${RESET}"
+  echo -e "  Registry:      ${DIM}${REGISTRY}${RESET}"
+  echo -e "  History:       ${DIM}${HISTORY}${RESET}"
+  echo -e "  Override dirs: ${DIM}export RACK_DIR=/your/path${RESET}"
+  echo -e "                 ${DIM}export RACK_HISTORY=/your/path${RESET}"
+  exit 1
+}
+
+die() {
+  echo -e "\n${RED}✖ error:${RESET} $*" >&2
+  exit 1
+}
+
+step() {
+  echo -e "\n${CYAN}::${RESET} ${BOLD}$*${RESET}"
+}
+
+info() {
+  echo -e "   ${DIM}$*${RESET}"
+}
+
+ok() {
+  echo -e "   ${GREEN}✔${RESET} $*"
+}
+
+warn() {
+  echo -e "   ${YELLOW}⚠${RESET}  $*"
+}
+
+spinner_start() {
+  SPINNER_MSG="$1"
+  SPINNER_CHARS='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  SPINNER_PID=""
+  (
+    i=0
+    while true; do
+      char="${SPINNER_CHARS:$((i % ${#SPINNER_CHARS})):1}"
+      printf "\r   ${CYAN}%s${RESET} %s..." "$char" "$SPINNER_MSG" >&2
+      sleep 0.08
+      ((i++))
+    done
+  ) &
+  SPINNER_PID=$!
+}
+
+spinner_stop() {
+  if [[ -n "${SPINNER_PID:-}" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null
+    wait "$SPINNER_PID" 2>/dev/null || true
+    printf "\r\033[K" >&2
+    SPINNER_PID=""
+  fi
+}
+
+trap 'spinner_stop' EXIT
+
+# ── registry helpers ──────────────────────────────────────────────────────────
+# Format: NAME <TAB> URL <TAB> INSTALL_PATH <TAB> TIMESTAMP
+
+registry_ensure() {
+  mkdir -p "$(dirname "$REGISTRY")"
+  [[ -f "$REGISTRY" ]] || touch "$REGISTRY"
+}
+
+registry_add() {
+  local name="$1" url="$2" path="$3"
+  registry_ensure
+  registry_remove_entry "$name"
+  echo -e "${name}\t${url}\t${path}\t$(date '+%Y-%m-%d %H:%M:%S')" >> "$REGISTRY"
+}
+
+registry_remove_entry() {
+  local name="$1"
+  registry_ensure
+  if [[ -f "$REGISTRY" ]]; then
+    local tmpfile
+    tmpfile="$(mktemp)"
+    grep -v $'^'"${name}"$'\t' "$REGISTRY" > "$tmpfile" || true
+    mv "$tmpfile" "$REGISTRY"
+  fi
+}
+
+registry_lookup() {
+  local name="$1"
+  registry_ensure
+  grep $'^'"${name}"$'\t' "$REGISTRY" 2>/dev/null | head -n 1 || true
+}
+
+registry_list() {
+  registry_ensure
+  if [[ ! -s "$REGISTRY" ]]; then
+    echo -e "   ${DIM}No managed installs found.${RESET}"
+    return
+  fi
+
+  printf "\n   %-20s %-25s %s\n" "NAME" "INSTALLED" "URL"
+  printf "   %-20s %-25s %s\n" "────────────────────" "─────────────────────────" "───────────────────────────────"
+  while IFS=$'\t' read -r name url path timestamp; do
+    printf "   ${GREEN}%-20s${RESET} ${DIM}%-25s${RESET} %s\n" "$name" "$timestamp" "$url"
+  done < "$REGISTRY"
+  echo ""
+}
+
+# ── history helpers ───────────────────────────────────────────────────────────
+# Format: NAME <TAB> URL <TAB> TIMESTAMP
+# Append-only; one entry per URL change (re-downloading same URL is silent)
+
+history_append() {
+  local name="$1" url="$2"
+  mkdir -p "$(dirname "$HISTORY")"
+  [[ -f "$HISTORY" ]] || touch "$HISTORY"
+  printf '%s\t%s\t%s\n' "$name" "$url" "$(date '+%Y-%m-%d %H:%M:%S')" >> "$HISTORY"
+}
+
+# ── GitHub slug resolution ────────────────────────────────────────────────────
+
+_gh_api_get() {
+  local api_url="$1" outfile="$2"
+  if command -v curl &>/dev/null; then
+    curl -sf -H "Accept: application/vnd.github+json" \
+         -H "X-GitHub-Api-Version: 2022-11-28" \
+         -o "$outfile" "$api_url" 2>/dev/null
+  elif command -v wget &>/dev/null; then
+    wget -q --header="Accept: application/vnd.github+json" \
+         -O "$outfile" "$api_url" 2>/dev/null
+  else
+    die "Neither curl nor wget found."
+  fi
+}
+
+_gh_asset_urls() {
+  grep -o '"browser_download_url": *"[^"]*"' "$1" | grep -o 'https://[^"]*'
+}
+
+_gh_tag_name() {
+  grep -o '"tag_name": *"[^"]*"' "$1" | grep -o '"[^"]*"$' | tr -d '"' | head -n1
+}
+
+_gh_repo_names() {
+  grep -o '"full_name": *"[^"]*"' "$1" | grep -o '"[^"]*"$' | tr -d '"'
+}
+
+PICK_RESULT=""
+_pick_numbered() {
+  local prompt="$1"; shift
+  local -a items=("$@")
+  local i=1 choice
+  for item in "${items[@]}"; do
+    printf "   ${CYAN}%3d)${RESET}  %s\n" "$i" "$item"
+    ((i++))
+  done
+  echo ""
+  while true; do
+    printf "   ${BOLD}%s${RESET} " "$prompt"
+    read -r choice < /dev/tty
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#items[@]} )); then
+      PICK_RESULT="${items[$((choice-1))]}"
+      return 0
+    fi
+    warn "Enter a number between 1 and ${#items[@]}."
+  done
+}
+
+_gh_resolve_release() {
+  local slug="$1" allow_search="${2:-true}"
+  local json_file rc=0
+
+  json_file="$(mktemp)"
+  spinner_start "Fetching latest release for '${slug}'"
+  _gh_api_get "https://api.github.com/repos/${slug}/releases/latest" "$json_file" || rc=$?
+  spinner_stop
+
+  if [[ $rc -ne 0 ]] || ! grep -q '"tag_name"' "$json_file" 2>/dev/null; then
+    rm -f "$json_file"
+    if [[ "$allow_search" == true ]]; then
+      local bare="${slug##*/}"
+      warn "No release found for '${slug}' — searching GitHub..."
+      echo ""
+      _gh_search_and_pick "$bare"
+      return
+    fi
+    die "Could not fetch a release for '${slug}'. Verify the repo exists and has published releases."
+  fi
+
+  local tag
+  tag="$(_gh_tag_name "$json_file")"
+  ok "Found release: ${tag}"
+
+  local -a ASSET_URLS
+  mapfile -t ASSET_URLS < <(_gh_asset_urls "$json_file")
+  rm -f "$json_file"
+
+  if [[ "${#ASSET_URLS[@]}" -eq 0 ]]; then
+    die "Release '${tag}' for '${slug}' has no downloadable assets."
+  fi
+
+  if [[ "${#ASSET_URLS[@]}" -eq 1 ]]; then
+    URL="${ASSET_URLS[0]}"
+    ok "Single asset: $(basename "$URL")"
+  else
+    step "Select asset"
+    info "Release ${tag} · ${#ASSET_URLS[@]} assets available for '${slug}'"
+    echo ""
+    [[ -t 0 ]] || die "Asset selection requires an interactive terminal."
+    local -a basenames=()
+    for u in "${ASSET_URLS[@]}"; do
+      basenames+=("$(basename "$u")")
+    done
+    _pick_numbered "Asset number:" "${basenames[@]}"
+    for u in "${ASSET_URLS[@]}"; do
+      [[ "$(basename "$u")" == "$PICK_RESULT" ]] && { URL="$u"; break; }
+    done
+    ok "Selected: $(basename "$URL")"
+  fi
+
+  if [[ "$ARCHIVE_MODE" == false ]]; then
+    local _f; _f="$(basename "$URL")"
+    case "$_f" in
+      *.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.zip) ARCHIVE_MODE=true ;;
+    esac
+  fi
+}
+
+_gh_search_and_pick() {
+  local query="$1" rc=0
+  local json_file
+
+  step "Searching GitHub"
+  info "Query: ${query}"
+
+  local encoded; encoded="$(printf '%s' "$query" | sed 's/ /+/g')"
+  json_file="$(mktemp)"
+  spinner_start "Querying GitHub"
+  _gh_api_get \
+    "https://api.github.com/search/repositories?q=${encoded}&per_page=10&sort=stars&order=desc" \
+    "$json_file" || rc=$?
+  spinner_stop
+
+  if [[ $rc -ne 0 ]]; then
+    rm -f "$json_file"
+    die "GitHub search failed for '${query}'. Check your connection or provide a full URL."
+  fi
+
+  local -A _seen_repos
+  local -a REPO_NAMES=()
+  while IFS= read -r rname; do
+    [[ -z "${_seen_repos[$rname]+x}" ]] && { REPO_NAMES+=("$rname"); _seen_repos["$rname"]=1; }
+  done < <(_gh_repo_names "$json_file")
+  rm -f "$json_file"
+
+  [[ "${#REPO_NAMES[@]}" -gt 0 ]] \
+    || die "No GitHub repositories found matching '${query}'."
+
+  ok "Found ${#REPO_NAMES[@]} matching repository(s)"
+  echo ""
+
+  local selected_repo
+  if [[ "${#REPO_NAMES[@]}" -eq 1 ]]; then
+    selected_repo="${REPO_NAMES[0]}"
+    ok "Only match: ${selected_repo}"
+  else
+    [[ -t 0 ]] || die "Repository selection requires an interactive terminal."
+    _pick_numbered "Repo number:" "${REPO_NAMES[@]}"
+    selected_repo="$PICK_RESULT"
+    ok "Selected: ${selected_repo}"
+  fi
+
+  echo ""
+  _gh_resolve_release "$selected_repo" false
+}
+
+github_resolve_slug() {
+  local input="$1"
+  step "Resolving GitHub reference"
+  info "Input: ${input}"
+  if [[ "$input" =~ ^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$ ]]; then
+    _gh_resolve_release "$input" true
+  else
+    _gh_search_and_pick "$input"
+  fi
+}
+
+# Extract owner/repo from a GitHub release download URL
+_gh_slug_from_url() {
+  [[ "$1" =~ github\.com/([^/]+/[^/]+)/releases/ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# Extract the release tag from a GitHub release download URL
+_gh_tag_from_url() {
+  [[ "$1" =~ github\.com/[^/]+/[^/]+/releases/download/([^/]+)/ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# Fetch the latest release tag for a slug. Outputs the tag to stdout; returns 1 on failure.
+_gh_latest_tag_for_slug() {
+  local slug="$1" rc=0 json_file
+  json_file="$(mktemp)"
+  _gh_api_get "https://api.github.com/repos/${slug}/releases/latest" "$json_file" || rc=$?
+  if [[ $rc -ne 0 ]] || ! grep -q '"tag_name"' "$json_file" 2>/dev/null; then
+    rm -f "$json_file"
+    return 1
+  fi
+  local tag; tag="$(_gh_tag_name "$json_file")"
+  rm -f "$json_file"
+  printf '%s\n' "$tag"
+}
+
+# Select the correct asset for an update. Tries to auto-match by replacing the old tag
+# in the current filename; falls back to interactive picker if the filename changed.
+# Sets global URL and ARCHIVE_MODE.
+_gh_select_update_asset() {
+  local slug="$1" old_tag="$2" new_tag="$3" old_url="$4"
+  local json_file rc=0
+
+  json_file="$(mktemp)"
+  spinner_start "Fetching assets for ${slug} ${new_tag}"
+  _gh_api_get "https://api.github.com/repos/${slug}/releases/latest" "$json_file" || rc=$?
+  spinner_stop
+
+  if [[ $rc -ne 0 ]] || ! grep -q '"tag_name"' "$json_file" 2>/dev/null; then
+    rm -f "$json_file"
+    die "Failed to fetch release assets for '${slug}'."
+  fi
+
+  local -a ASSET_URLS
+  mapfile -t ASSET_URLS < <(_gh_asset_urls "$json_file")
+  rm -f "$json_file"
+
+  [[ "${#ASSET_URLS[@]}" -gt 0 ]] \
+    || die "Release '${new_tag}' for '${slug}' has no downloadable assets."
+
+  if [[ "${#ASSET_URLS[@]}" -eq 1 ]]; then
+    URL="${ASSET_URLS[0]}"
+    ok "Asset: $(basename "$URL")"
+  else
+    local old_fname; old_fname="$(basename "$old_url")"
+    local new_fname; new_fname="${old_fname//${old_tag}/${new_tag}}"
+    local matched=""
+    for u in "${ASSET_URLS[@]}"; do
+      [[ "$(basename "$u")" == "$new_fname" ]] && { matched="$u"; break; }
+    done
+
+    if [[ -n "$matched" ]]; then
+      URL="$matched"
+      ok "Auto-matched: $(basename "$URL")"
+    else
+      step "Select asset for '${slug}' ${new_tag}"
+      info "Asset filename changed — please select manually:"
+      echo ""
+      [[ -t 0 ]] || die "Asset selection requires an interactive terminal."
+      local -a basenames=()
+      for u in "${ASSET_URLS[@]}"; do
+        basenames+=("$(basename "$u")")
+      done
+      _pick_numbered "Asset number:" "${basenames[@]}"
+      for u in "${ASSET_URLS[@]}"; do
+        [[ "$(basename "$u")" == "$PICK_RESULT" ]] && { URL="$u"; break; }
+      done
+      ok "Selected: $(basename "$URL")"
+    fi
+  fi
+
+  if [[ "$ARCHIVE_MODE" == false ]]; then
+    local _f; _f="$(basename "$URL")"
+    case "$_f" in
+      *.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.zip) ARCHIVE_MODE=true ;;
+    esac
+  fi
+}
+
+# ── download + install core ───────────────────────────────────────────────────
+# Reads globals: NAME, URL, ARCHIVE_MODE, INSTALL_DIR, REGISTRY, HISTORY
+_do_install() {
+  local archive_name="${URL##*/}"
+  archive_name="${archive_name%%\?*}"
+
+  TMPDIR_WORK="$(mktemp -d)"
+  trap 'spinner_stop; rm -rf "$TMPDIR_WORK"' EXIT
+  local tmpfile="${TMPDIR_WORK}/${archive_name}"
+
+  # ── download ─────────────────────────────────────────────────────────────
+  step "Downloading"
+  info "Source: ${URL}"
+  info "Saving to temp: ${tmpfile}"
+  echo ""
+
+  if command -v wget &>/dev/null; then
+    info "Using wget"
+    echo ""
+    wget --show-progress -q -O "$tmpfile" "$URL" && echo ""
+  elif command -v curl &>/dev/null; then
+    info "Using curl"
+    echo ""
+    curl -L --progress-bar -o "$tmpfile" "$URL" && echo ""
+  else
+    die "Neither wget nor curl found. Install one and try again."
+  fi
+
+  local filesize
+  filesize="$(du -sh "$tmpfile" 2>/dev/null | cut -f1)"
+  ok "Download complete (${filesize})"
+
+  # ── archive extraction ────────────────────────────────────────────────────
+  if [[ "$ARCHIVE_MODE" == true ]]; then
+    step "Extracting archive"
+    info "Archive: ${archive_name}"
+
+    local extract_dir="${TMPDIR_WORK}/extracted"
+    mkdir -p "$extract_dir"
+
+    local format
+    spinner_start "Extracting"
+    case "$archive_name" in
+      *.tar.gz|*.tgz)  tar -xzf "$tmpfile" -C "$extract_dir"; format="tar.gz" ;;
+      *.tar.bz2)       tar -xjf "$tmpfile" -C "$extract_dir"; format="tar.bz2" ;;
+      *.tar.xz)        tar -xJf "$tmpfile" -C "$extract_dir"; format="tar.xz" ;;
+      *.zip)
+        command -v unzip &>/dev/null || { spinner_stop; die "'unzip' not found. Install it and try again."; }
+        unzip -q "$tmpfile" -d "$extract_dir"
+        format="zip"
+        ;;
+      *)
+        spinner_stop
+        die "Unrecognised archive format: '${archive_name}'. Supported: .tar.gz .tgz .tar.bz2 .tar.xz .zip"
+        ;;
+    esac
+    spinner_stop
+    ok "Extracted (${format})"
+
+    info "Archive contents (top level):"
+    find "$extract_dir" -maxdepth 2 | sed "s|${extract_dir}||" | sed '/^$/d' \
+      | while IFS= read -r line; do echo -e "      ${DIM}${line}${RESET}"; done
+
+    step "Locating binary"
+
+    local binary
+    spinner_start "Searching for '${NAME}'"
+    binary="$(find "$extract_dir" -type f -name "$NAME" | head -n 1)"
+    spinner_stop
+
+    if [[ -n "$binary" ]]; then
+      ok "Found exact match: ${binary#"$extract_dir"}"
+    else
+      warn "No file named '${NAME}' found — falling back to first executable..."
+      spinner_start "Scanning for executables"
+      binary="$(find "$extract_dir" -type f -perm /111 | head -n 1)"
+      spinner_stop
+
+      if [[ -n "$binary" ]]; then
+        warn "Using: $(basename "$binary") → will be installed as '${NAME}'"
+      else
+        die "No executable binary found in archive. You may need to inspect it manually."
+      fi
+    fi
+
+    spinner_start "Copying binary"
+    cp "$binary" "${INSTALL_DIR}/${NAME}"
+    spinner_stop
+    ok "Binary copied to install dir"
+
+  else
+    step "Installing binary"
+    spinner_start "Copying"
+    cp "$tmpfile" "${INSTALL_DIR}/${NAME}"
+    spinner_stop
+    ok "Binary copied to install dir"
+  fi
+
+  # ── chmod ──────────────────────────────────────────────────────────────────
+  step "Setting permissions"
+  spinner_start "chmod +x"
+  chmod +x "${INSTALL_DIR}/${NAME}"
+  spinner_stop
+  ok "Marked as executable"
+
+  # ── registry & history ─────────────────────────────────────────────────────
+  step "Updating registry"
+  local _cur_entry _cur_url
+  _cur_entry="$(registry_lookup "$NAME")"
+  _cur_url="$(printf '%s' "$_cur_entry" | cut -f2)"
+  spinner_start "Recording install"
+  [[ -z "$_cur_entry" || "$URL" != "$_cur_url" ]] && history_append "$NAME" "$URL"
+  registry_add "$NAME" "$URL" "${INSTALL_DIR}/${NAME}"
+  spinner_stop
+  ok "Registered: ${REGISTRY}"
+}
+
+# ── 'rack update' subcommand ─────────────────────────────────────────────────
+if [[ "${1:-}" == "update" ]]; then
+  echo -e "\n${BOLD}rack update — checking managed installs for updates${RESET}"
+
+  step "Loading registry"
+  registry_ensure
+  info "Registry: ${REGISTRY}"
+  if [[ ! -s "$REGISTRY" ]]; then
+    warn "Registry is empty — nothing to update."
+    echo ""
+    exit 0
+  fi
+  TOTAL="$(grep -c '' "$REGISTRY" 2>/dev/null || echo 0)"
+  ok "Found ${TOTAL} managed install(s)"
+
+  step "Checking for updates"
+  info "Querying GitHub releases API for each install..."
+  echo ""
+
+  declare -a UPD_NAMES=()
+  declare -a UPD_SLUGS=()
+  declare -a UPD_OLD_TAGS=()
+  declare -a UPD_NEW_TAGS=()
+  declare -a UPD_OLD_URLS=()
+  UPTODATE_COUNT=0
+  SKIP_COUNT=0
+
+  while IFS=$'\t' read -r reg_name reg_url reg_path reg_ts; do
+    slug="$(_gh_slug_from_url "$reg_url")"
+    if [[ -z "$slug" ]]; then
+      printf "   ${DIM}~  %-20s non-GitHub URL — skipped${RESET}\n" "$reg_name"
+      ((SKIP_COUNT++)) || true
+      continue
+    fi
+
+    cur_tag="$(_gh_tag_from_url "$reg_url")"
+    if [[ -z "$cur_tag" ]]; then
+      printf "   ${DIM}~  %-20s could not parse version — skipped${RESET}\n" "$reg_name"
+      ((SKIP_COUNT++)) || true
+      continue
+    fi
+
+    spinner_start "Checking ${reg_name} (${cur_tag})"
+    latest_tag="$(_gh_latest_tag_for_slug "$slug")" || {
+      spinner_stop
+      printf "   ${YELLOW}⚠${RESET}  %-20s ${DIM}API error — skipped${RESET}\n" "$reg_name"
+      ((SKIP_COUNT++)) || true
+      continue
+    }
+    spinner_stop
+
+    if [[ "$latest_tag" == "$cur_tag" ]]; then
+      printf "   ${GREEN}✔${RESET}  %-20s ${DIM}${cur_tag} — up to date${RESET}\n" "$reg_name"
+      ((UPTODATE_COUNT++)) || true
+    else
+      printf "   ${YELLOW}↑${RESET}  %-20s ${DIM}${cur_tag}${RESET} → ${CYAN}${latest_tag}${RESET}\n" \
+        "$reg_name"
+      UPD_NAMES+=("$reg_name")
+      UPD_SLUGS+=("$slug")
+      UPD_OLD_TAGS+=("$cur_tag")
+      UPD_NEW_TAGS+=("$latest_tag")
+      UPD_OLD_URLS+=("$reg_url")
+    fi
+  done < "$REGISTRY"
+
+  echo ""
+
+  if [[ "${#UPD_NAMES[@]}" -eq 0 ]]; then
+    echo -e "${GREEN}${BOLD}✔ All installs are up to date.${RESET}"
+    [[ "$SKIP_COUNT" -gt 0 ]] \
+      && echo -e "   ${DIM}(${SKIP_COUNT} skipped — non-GitHub or unresolvable)${RESET}"
+    echo ""
+    exit 0
+  fi
+
+  echo -e "${YELLOW}${BOLD}${#UPD_NAMES[@]} update(s) available:${RESET}"
+  echo ""
+  printf "   %-20s  %-15s  %s\n" "BINARY" "CURRENT" "LATEST"
+  printf "   %-20s  %-15s  %s\n" "────────────────────" "───────────────" "───────────────"
+  for i in "${!UPD_NAMES[@]}"; do
+    printf "   ${BOLD}%-20s${RESET}  ${DIM}%-15s${RESET}  ${CYAN}%s${RESET}\n" \
+      "${UPD_NAMES[$i]}" "${UPD_OLD_TAGS[$i]}" "${UPD_NEW_TAGS[$i]}"
+  done
+  echo ""
+  [[ "$UPTODATE_COUNT" -gt 0 ]] \
+    && echo -e "   ${DIM}${UPTODATE_COUNT} already up to date.${RESET}"
+  [[ "$SKIP_COUNT" -gt 0 ]] \
+    && echo -e "   ${DIM}${SKIP_COUNT} skipped (non-GitHub or unresolvable).${RESET}"
+  echo ""
+
+  if [[ ! -t 0 ]]; then
+    echo -e "   ${DIM}Non-interactive — skipping update prompt.${RESET}"
+    echo ""
+    exit 0
+  fi
+
+  echo -en "   ${BOLD}Apply all updates? [y/N]${RESET} "
+  read -r CONFIRM
+  [[ "$CONFIRM" =~ ^[Yy]$ ]] || {
+    echo -e "\n   ${DIM}Aborted. Nothing was changed.${RESET}\n"
+    exit 0
+  }
+
+  for i in "${!UPD_NAMES[@]}"; do
+    NAME="${UPD_NAMES[$i]}"
+    SLUG="${UPD_SLUGS[$i]}"
+    OLD_TAG="${UPD_OLD_TAGS[$i]}"
+    NEW_TAG="${UPD_NEW_TAGS[$i]}"
+    OLD_URL="${UPD_OLD_URLS[$i]}"
+
+    echo ""
+    echo -e "${BOLD}── ${NAME}  ${DIM}${OLD_TAG} → ${CYAN}${NEW_TAG}${RESET}${BOLD} ─${RESET}"
+
+    step "Selecting asset"
+    ARCHIVE_MODE=false
+    _gh_select_update_asset "$SLUG" "$OLD_TAG" "$NEW_TAG" "$OLD_URL"
+
+    step "Checking install directory"
+    mkdir -p "$INSTALL_DIR"
+    ok "Install dir: ${INSTALL_DIR}"
+
+    _do_install
+
+    echo ""
+    echo -e "   ${GREEN}✔${RESET} ${BOLD}${NAME}${RESET} updated  ${DIM}${OLD_TAG} → ${CYAN}${NEW_TAG}${RESET}"
+  done
+
+  echo ""
+  echo -e "${GREEN}${BOLD}✔ All updates applied.${RESET}"
+  echo ""
+  exit 0
+fi
+
+# ── flag parsing ──────────────────────────────────────────────────────────────
+ARCHIVE_MODE=false
+REMOVE_MODE=false
+LIST_MODE=false
+UPDATE_MODE=false
+ROLLBACK_MODE=false
+HISTORY_MODE=false
+
+while getopts ":aRluHr" opt; do
+  case $opt in
+    a) ARCHIVE_MODE=true ;;
+    R) REMOVE_MODE=true ;;
+    l) LIST_MODE=true ;;
+    u) UPDATE_MODE=true ;;
+    r) ROLLBACK_MODE=true ;;
+    H) HISTORY_MODE=true ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+# ── list mode ─────────────────────────────────────────────────────────────────
+if [[ "$LIST_MODE" == true ]]; then
+  echo -e "\n${BOLD}rack — managed installs${RESET}"
+
+  step "Locating registry"
+  registry_ensure
+  info "Registry: ${REGISTRY}"
+  if [[ -f "$REGISTRY" ]]; then
+    ok "Registry found"
+  else
+    warn "Registry does not exist yet — nothing has been installed."
+    echo ""
+    exit 0
+  fi
+
+  step "Reading entries"
+  TOTAL="$(grep -c '' "$REGISTRY" 2>/dev/null || echo 0)"
+  if [[ "$TOTAL" -eq 0 ]]; then
+    warn "Registry is empty — no managed installs recorded."
+    echo ""
+    exit 0
+  fi
+  ok "Found ${TOTAL} managed install(s)"
+
+  step "Verifying installs on disk"
+  MISSING=0
+  while IFS=$'\t' read -r name url path timestamp; do
+    if [[ -f "$path" ]]; then
+      FILESIZE="$(du -sh "$path" 2>/dev/null | cut -f1)"
+      ok "${name}  ${DIM}(${FILESIZE})${RESET}"
+      info "Path:      ${path}"
+      info "Source:    ${url}"
+      info "Installed: ${timestamp}"
+    else
+      warn "${name}  ${RED}(missing from disk)${RESET}"
+      info "Expected:  ${path}"
+      info "Source:    ${url}"
+      info "Installed: ${timestamp}"
+      ((MISSING++)) || true
+    fi
+  done < "$REGISTRY"
+
+  echo ""
+  if [[ "$MISSING" -gt 0 ]]; then
+    echo -e "${YELLOW}${BOLD}⚠ ${MISSING} install(s) missing from disk.${RESET}"
+    echo -e "   Run ${BOLD}rack -R <name>${RESET} to clean up stale registry entries."
+  else
+    echo -e "${GREEN}${BOLD}✔ All installs verified on disk.${RESET}"
+  fi
+  echo ""
+  exit 0
+fi
+
+# ── history mode ──────────────────────────────────────────────────────────────
+if [[ "$HISTORY_MODE" == true ]]; then
+  [[ $# -lt 1 ]] && die "History mode requires a name. Usage: rack -H <name>"
+
+  NAME="$1"
+
+  echo -e "\n${BOLD}rack — URL history for '${NAME}'${RESET}"
+
+  step "Validating arguments"
+  [[ "$NAME" =~ ^[a-zA-Z0-9._-]+$ ]] \
+    || die "Invalid name '${NAME}'. Use only letters, numbers, dots, dashes, underscores."
+  ok "Name: ${NAME}"
+
+  step "Reading history"
+  info "History file: ${HISTORY}"
+
+  if [[ ! -f "$HISTORY" ]]; then
+    warn "No history file found — nothing has been installed yet."
+    echo ""
+    exit 0
+  fi
+
+  mapfile -t HIST_ENTRIES < <(grep $'^'"${NAME}"$'\t' "$HISTORY" 2>/dev/null || true)
+  HIST_COUNT="${#HIST_ENTRIES[@]}"
+
+  if [[ "$HIST_COUNT" -eq 0 ]]; then
+    warn "No history found for '${NAME}'."
+    echo ""
+    exit 0
+  fi
+
+  ok "Found ${HIST_COUNT} URL(s) in history"
+
+  CUR_ENTRY="$(registry_lookup "$NAME")"
+  CUR_URL="$(printf '%s' "$CUR_ENTRY" | cut -f2)"
+
+  echo ""
+  printf "   %-5s  %-19s  %s\n" "INDEX" "INSTALLED" "URL"
+  printf "   %-5s  %-19s  %s\n" "─────" "───────────────────" "───────────────────────────────"
+
+  idx=1
+  for entry in "${HIST_ENTRIES[@]}"; do
+    url="$(printf '%s' "$entry" | cut -f2)"
+    timestamp="$(printf '%s' "$entry" | cut -f3)"
+    if [[ -n "$CUR_URL" && "$url" == "$CUR_URL" ]]; then
+      printf "   ${CYAN}%-5s${RESET}  ${DIM}%-19s${RESET}  %s  ${DIM}← current${RESET}\n" \
+        "$idx" "$timestamp" "$url"
+    else
+      printf "   ${CYAN}%-5s${RESET}  ${DIM}%-19s${RESET}  %s\n" "$idx" "$timestamp" "$url"
+    fi
+    ((idx++))
+  done
+
+  echo ""
+  if [[ "$HIST_COUNT" -gt 1 ]]; then
+    echo -e "   Roll back with: ${BOLD}rack -r ${NAME} <index>${RESET}"
+  fi
+  echo ""
+  exit 0
+fi
+
+# ── rollback mode ─────────────────────────────────────────────────────────────
+if [[ "$ROLLBACK_MODE" == true ]]; then
+  [[ $# -lt 2 ]] && die "Rollback mode requires a name and index. Usage: rack -r <name> <index>"
+
+  NAME="$1"
+  INDEX="$2"
+
+  echo -e "\n${BOLD}rack — rolling back '${NAME}'${RESET}"
+
+  step "Validating arguments"
+  [[ "$NAME" =~ ^[a-zA-Z0-9._-]+$ ]] \
+    || die "Invalid name '${NAME}'. Use only letters, numbers, dots, dashes, underscores."
+  ok "Name: ${NAME}"
+
+  [[ "$INDEX" =~ ^[0-9]+$ && "$INDEX" -gt 0 ]] \
+    || die "Index must be a positive integer. Usage: rack -r ${NAME} <index>"
+  ok "Index: ${INDEX}"
+
+  step "Reading history"
+  info "History file: ${HISTORY}"
+
+  [[ -f "$HISTORY" ]] \
+    || die "No history file found. Has '${NAME}' been installed before?"
+
+  mapfile -t HIST_ENTRIES < <(grep $'^'"${NAME}"$'\t' "$HISTORY" 2>/dev/null || true)
+  HIST_COUNT="${#HIST_ENTRIES[@]}"
+
+  [[ "$HIST_COUNT" -gt 0 ]] \
+    || die "No history found for '${NAME}'. Has it been installed before?"
+
+  ok "Found ${HIST_COUNT} URL(s) in history"
+
+  [[ "$INDEX" -le "$HIST_COUNT" ]] \
+    || die "Index ${INDEX} out of range — history has ${HIST_COUNT} entry(s). Run: rack -H ${NAME}"
+
+  TARGET_URL="$(printf '%s' "${HIST_ENTRIES[$((INDEX-1))]}" | cut -f2)"
+  TARGET_TS="$(printf '%s' "${HIST_ENTRIES[$((INDEX-1))]}" | cut -f3)"
+  ok "Target URL (index ${INDEX}): ${TARGET_URL}"
+  info "Recorded: ${TARGET_TS}"
+
+  CUR_ENTRY="$(registry_lookup "$NAME")"
+  if [[ -n "$CUR_ENTRY" ]]; then
+    CUR_URL="$(printf '%s' "$CUR_ENTRY" | cut -f2)"
+    if [[ "$TARGET_URL" == "$CUR_URL" ]]; then
+      warn "This is already the active URL — will re-download and reinstall."
+    else
+      warn "Currently active: ${CUR_URL}"
+    fi
+  else
+    warn "'${NAME}' not currently in registry — will install fresh."
+  fi
+
+  URL="$TARGET_URL"
+
+  # Auto-detect archive mode from URL filename if -a not explicitly set
+  if [[ "$ARCHIVE_MODE" == false ]]; then
+    _fname="${URL##*/}"
+    _fname="${_fname%%\?*}"
+    case "$_fname" in
+      *.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.zip) ARCHIVE_MODE=true ;;
+    esac
+  fi
+
+  [[ "$ARCHIVE_MODE" == true ]] \
+    && ok "Mode: archive extraction" \
+    || ok "Mode: direct binary"
+
+  step "Checking install directory"
+  mkdir -p "$INSTALL_DIR"
+  ok "Install dir: ${INSTALL_DIR}"
+
+  _do_install
+
+  echo ""
+  echo -e "${GREEN}${BOLD}✔ Done!${RESET}"
+  echo -e "   ${BOLD}${NAME}${RESET} rolled back to URL #${INDEX} → ${INSTALL_DIR}/${NAME}"
+  echo -e "   Run it with: ${BOLD}${NAME}${RESET}"
+  echo ""
+  exit 0
+fi
+
+# ── update mode ───────────────────────────────────────────────────────────────
+if [[ "$UPDATE_MODE" == true ]]; then
+  [[ $# -lt 1 ]] && die "Update mode requires a name. Usage: rack -u <name> [new-url]"
+
+  NAME="$1"
+  ALT_URL="${2:-}"
+
+  echo -e "\n${BOLD}rack — updating '${NAME}'${RESET}"
+
+  step "Validating arguments"
+  [[ "$NAME" =~ ^[a-zA-Z0-9._-]+$ ]] \
+    || die "Invalid name '${NAME}'. Use only letters, numbers, dots, dashes, underscores."
+  ok "Name: ${NAME}"
+
+  step "Checking registry"
+  info "Registry: ${REGISTRY}"
+  spinner_start "Looking up '${NAME}'"
+  ENTRY="$(registry_lookup "$NAME")"
+  spinner_stop
+
+  [[ -n "$ENTRY" ]] \
+    || die "'${NAME}' is not managed by rack. Install it first with: rack ${NAME} <url>"
+
+  STORED_URL="$(echo "$ENTRY" | cut -f2)"
+  INSTALLED_AT="$(echo "$ENTRY" | cut -f4)"
+  ok "Registry entry found"
+  info "Installed: ${INSTALLED_AT}"
+  info "Recorded URL: ${STORED_URL}"
+
+  if [[ -n "$ALT_URL" ]]; then
+    if [[ "$ALT_URL" =~ ^https?:// ]]; then
+      URL="$ALT_URL"
+    else
+      github_resolve_slug "$ALT_URL"
+    fi
+    warn "Using alternative URL (registry will be updated)"
+    info "Old: ${STORED_URL}"
+    info "New: ${URL}"
+  else
+    URL="$STORED_URL"
+    ok "Using recorded URL"
+  fi
+
+  # Auto-detect archive mode from URL filename if -a not explicitly set
+  if [[ "$ARCHIVE_MODE" == false ]]; then
+    _fname="${URL##*/}"
+    _fname="${_fname%%\?*}"
+    case "$_fname" in
+      *.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.zip) ARCHIVE_MODE=true ;;
+    esac
+  fi
+
+  [[ "$ARCHIVE_MODE" == true ]] \
+    && ok "Mode: archive extraction" \
+    || ok "Mode: direct binary"
+
+  step "Checking install directory"
+  mkdir -p "$INSTALL_DIR"
+  ok "Install dir: ${INSTALL_DIR}"
+
+  _do_install
+
+  echo ""
+  echo -e "${GREEN}${BOLD}✔ Done!${RESET}"
+  echo -e "   ${BOLD}${NAME}${RESET} has been updated → ${INSTALL_DIR}/${NAME}"
+  [[ -n "$ALT_URL" ]] && echo -e "   Registry updated with new source URL."
+  echo -e "   Run it with: ${BOLD}${NAME}${RESET}"
+  echo ""
+  exit 0
+fi
+
+# ── remove mode ───────────────────────────────────────────────────────────────
+if [[ "$REMOVE_MODE" == true ]]; then
+  [[ $# -lt 1 ]] && die "Remove mode requires a name. Usage: rack -R <name>"
+
+  NAME="$1"
+
+  echo -e "\n${BOLD}rack — removing '${NAME}'${RESET}"
+
+  # ── validate name ───────────────────────────────────────────────────────
+  step "Validating arguments"
+  [[ "$NAME" =~ ^[a-zA-Z0-9._-]+$ ]] \
+    || die "Invalid name '${NAME}'. Use only letters, numbers, dots, dashes, underscores."
+  ok "Name: ${NAME}"
+  ok "Mode: remove (-R)"
+
+  # ── lookup in registry ──────────────────────────────────────────────────
+  step "Checking registry"
+  info "Registry: ${REGISTRY}"
+  spinner_start "Looking up '${NAME}'"
+  ENTRY="$(registry_lookup "$NAME")"
+  spinner_stop
+
+  if [[ -n "$ENTRY" ]]; then
+    INSTALL_PATH="$(echo "$ENTRY" | cut -f3)"
+    SOURCE_URL="$(echo "$ENTRY"  | cut -f2)"
+    INSTALLED_AT="$(echo "$ENTRY" | cut -f4)"
+    ok "Registry entry found"
+    info "Install path: ${INSTALL_PATH}"
+    info "Source URL:   ${SOURCE_URL}"
+    info "Installed at: ${INSTALLED_AT}"
+  else
+    warn "No registry entry for '${NAME}'"
+    warn "Will attempt to remove from default install dir anyway: ${INSTALL_DIR}/${NAME}"
+    INSTALL_PATH="${INSTALL_DIR}/${NAME}"
+    SOURCE_URL="(unknown — not in registry)"
+    INSTALLED_AT="(unknown)"
+  fi
+
+  # ── verify on disk ──────────────────────────────────────────────────────
+  step "Verifying target on disk"
+  info "Target: ${INSTALL_PATH}"
+
+  if [[ -f "$INSTALL_PATH" ]]; then
+    FILESIZE="$(du -sh "$INSTALL_PATH" 2>/dev/null | cut -f1)"
+    ok "File exists (${FILESIZE})"
+  else
+    warn "File not found at '${INSTALL_PATH}' — nothing to delete on disk."
+    if [[ -n "$ENTRY" ]]; then
+      step "Cleaning up stale registry entry"
+      spinner_start "Removing entry for '${NAME}'"
+      registry_remove_entry "$NAME"
+      spinner_stop
+      ok "Stale registry entry removed"
+    fi
+    echo ""
+    echo -e "${YELLOW}${BOLD}⚠ Nothing removed from disk${RESET} (file was already gone)"
+    echo ""
+    exit 0
+  fi
+
+  # ── confirm ─────────────────────────────────────────────────────────────
+  step "Confirming removal"
+  info "Binary:  ${INSTALL_PATH}"
+  info "Source:  ${SOURCE_URL}"
+  if [[ -t 0 ]]; then
+    echo ""
+    echo -e "   ${YELLOW}This will permanently delete ${BOLD}${NAME}${RESET}${YELLOW} from ${INSTALL_PATH}.${RESET}"
+    echo -en "   ${YELLOW}Continue? [y/N]${RESET} "
+    read -r CONFIRM
+    [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo -e "\n   ${DIM}Aborted. Nothing was changed.${RESET}\n"; exit 0; }
+    ok "Confirmed"
+  else
+    info "Non-interactive mode — skipping confirmation prompt"
+  fi
+
+  # ── delete binary ───────────────────────────────────────────────────────
+  step "Removing binary"
+  info "Deleting: ${INSTALL_PATH}"
+  spinner_start "Removing file"
+  rm -f "$INSTALL_PATH"
+  spinner_stop
+  ok "Deleted: ${INSTALL_PATH}"
+
+  # ── clean registry ──────────────────────────────────────────────────────
+  step "Updating registry"
+  info "Registry: ${REGISTRY}"
+  spinner_start "Removing entry for '${NAME}'"
+  registry_remove_entry "$NAME"
+  spinner_stop
+  ok "Registry entry removed"
+  REMAINING="$(grep -c '' "$REGISTRY" 2>/dev/null || echo 0)"
+  info "${REMAINING} install(s) remaining in registry"
+
+  # ── summary ─────────────────────────────────────────────────────────────
+  echo ""
+  echo -e "${GREEN}${BOLD}✔ Done!${RESET}"
+  echo -e "   ${BOLD}${NAME}${RESET} has been removed."
+  echo -e "   It was originally installed from: ${DIM}${SOURCE_URL}${RESET}"
+  echo -e "   Reinstall with: ${BOLD}rack ${NAME} <url>${RESET}"
+  echo ""
+  exit 0
+fi
+
+# ── install mode: require name + url ─────────────────────────────────────────
+[[ $# -lt 2 ]] && usage
+
+NAME="$1"
+URL="$2"
+
+# ── validation ────────────────────────────────────────────────────────────────
+step "Validating arguments"
+
+[[ "$NAME" =~ ^[a-zA-Z0-9._-]+$ ]] \
+  || die "Invalid name '${NAME}'. Use only letters, numbers, dots, dashes, underscores."
+ok "Name:  ${NAME}"
+
+if [[ "$URL" =~ ^https?:// ]]; then
+  ok "URL:   ${URL}"
+elif [[ -n "$URL" ]]; then
+  github_resolve_slug "$URL"
+  ok "Resolved: ${URL}"
+else
+  die "Provide a URL (https://...) or a GitHub slug (owner/repo or a repo name)."
+fi
+
+[[ "$ARCHIVE_MODE" == true ]] \
+  && ok "Mode:  archive extraction (-a)" \
+  || ok "Mode:  direct binary install"
+
+# ── install dir setup ─────────────────────────────────────────────────────────
+step "Checking install directory"
+
+mkdir -p "$INSTALL_DIR"
+ok "Install dir: ${INSTALL_DIR}"
+
+if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
+  warn "'${INSTALL_DIR}' is not in your PATH."
+  warn "Add this to your ~/.bashrc or ~/.zshrc:"
+  echo -e "      ${DIM}export PATH=\"\$HOME/.local/bin:\$PATH\"${RESET}"
+else
+  ok "Install dir is in PATH"
+fi
+
+if [[ -f "${INSTALL_DIR}/${NAME}" ]]; then
+  EXISTING_ENTRY="$(registry_lookup "$NAME")"
+  if [[ -n "$EXISTING_ENTRY" ]]; then
+    warn "'${NAME}' was previously installed by rack — it will be overwritten."
+    info "Original source: $(echo "$EXISTING_ENTRY" | cut -f2)"
+  else
+    warn "'${NAME}' already exists at ${INSTALL_DIR}/${NAME} — it will be overwritten."
+  fi
+fi
+
+_do_install
+
+# ── summary ───────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${GREEN}${BOLD}✔ Done!${RESET}"
+echo -e "   Installed ${BOLD}${NAME}${RESET} → ${INSTALL_DIR}/${NAME}"
+echo -e "   Remove later with: ${BOLD}rack -R ${NAME}${RESET}"
+echo -e "   Run it with: ${BOLD}${NAME}${RESET}"
+echo ""

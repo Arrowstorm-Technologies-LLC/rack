@@ -1,0 +1,2 @@
+# registry and history live in ~/.local/share/rack/ — never committed
+*.tsv
