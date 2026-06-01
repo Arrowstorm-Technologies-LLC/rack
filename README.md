@@ -94,9 +94,30 @@ When given a GitHub slug, rack calls the GitHub releases API to resolve the late
 - Update checks require the source URL to contain a versioned release tag (e.g. `v1.2.3`). Binaries installed from tag-less URLs are skipped by `rack update`.
 - The GitHub API is queried unauthenticated (60 requests/hour). Running `rack update` with many managed installs may hit this limit.
 
+## Shell vs Python
+
+rack ships as two functionally identical scripts that share the same registry and history files — you can use either interchangeably, or switch between them at any point without losing your install history.
+
+**`rack`** (Bash) is the original. It has no runtime requirements beyond what ships on a base Linux system and starts in under 5ms. The tradeoff is that parsing JSON from the GitHub API is done with `grep -o` pattern matching — reliable against GitHub's consistently formatted responses, but not a full parser.
+
+**`rack.py`** (Python) was written to address that tradeoff directly. It uses Python's `json` module for proper API response parsing, `urllib` for HTTP (no `curl` or `wget` needed), and the standard `tarfile`/`zipfile` modules for archive extraction (no `tar` or `unzip` needed). This makes it more resilient to unexpected API responses and removes the dependency on external download tools entirely. The cost is Python 3.8+ as a requirement and a slightly slower startup (~50–150ms of import overhead vs. <5ms for Bash).
+
+In practice, both feel identical to use. The Python version is the better choice if you want robustness and easier extensibility; the Bash version is the better choice if you value a zero-dependency install or are on a minimal system.
+
+### Installing rack.py
+
+```sh
+curl -Lo ~/.local/bin/rack.py https://raw.githubusercontent.com/W4RM1ND/rack/main/rack.py
+chmod +x ~/.local/bin/rack.py
+```
+
+Usage is identical — just substitute `rack.py` for `rack` in any command.
+
 ## Dependencies
 
-`bash`, `wget` or `curl`, `tar`, `unzip`, `find`, `du`, `date`, `mktemp`, `grep`, `cut`, `mv`, `sed` — all present on a base Arch/Linux install.
+**rack** (Bash): `bash`, `wget` or `curl`, `tar`, `unzip`, `find`, `du`, `date`, `mktemp`, `grep`, `cut`, `mv`, `sed` — all present on a base Arch/Linux install.
+
+**rack.py** (Python): `python3` (3.8+) — HTTP, JSON parsing, and archive extraction are handled by the standard library. No external tools required.
 
 ## License
 
