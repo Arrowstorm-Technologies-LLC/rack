@@ -1,6 +1,8 @@
 # rack
 
-A personal binary manager for GitHub releases. Install any binary from a GitHub release URL or slug, track it by a name you choose, and update or remove it later — no package manager required.
+The Linux ecosystem is full of useful utilities that never make it into mainstream package managers — tools that live solely as binaries or archives on GitHub, quietly doing their thing for the people who know to look for them. Installing one is never hard, but it's never fast either: find the release page, grab the right asset for your arch, extract it, move it somewhere on your PATH, and remember where you got it from for next time. Repeat that often enough and it starts to feel like exactly the kind of thing a computer should be doing for you.
+
+rack is the result of that frustration. It's a single Bash script that installs any binary from a GitHub release by a name you choose, tracks where it came from, and lets you update or remove it later — without a daemon, a package database, or anything beyond what ships on a base Linux install.
 
 ```
 rack bat sharkdp/bat          # resolve latest release, pick an asset
