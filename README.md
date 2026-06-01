@@ -15,7 +15,7 @@ rack -l                       # list all managed installs
 ## Install
 
 ```sh
-curl -Lo ~/.local/bin/rack https://raw.githubusercontent.com/W4RM1ND/rack/main/rack
+curl -Lo ~/.local/bin/rack https://raw.githubusercontent.com/Arrowstorm-Technologies-LLC/rack/main/rack
 chmod +x ~/.local/bin/rack
 ```
 
@@ -107,7 +107,7 @@ In practice, both feel identical to use. The Python version is the better choice
 ### Installing rack.py
 
 ```sh
-curl -Lo ~/.local/bin/rack.py https://raw.githubusercontent.com/W4RM1ND/rack/main/rack.py
+curl -Lo ~/.local/bin/rack.py https://raw.githubusercontent.com/Arrowstorm-Technologies-LLC/rack/main/rack.py
 chmod +x ~/.local/bin/rack.py
 ```
 
