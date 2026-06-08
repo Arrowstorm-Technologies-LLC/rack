@@ -620,7 +620,7 @@ if [[ "${1:-}" == "update" ]]; then
     echo ""
     exit 0
   fi
-  TOTAL="$(grep -c '' "$REGISTRY" 2>/dev/null || echo 0)"
+  TOTAL="$(grep -c '' "$REGISTRY" 2>/dev/null || true)"
   ok "Found ${TOTAL} managed install(s)"
 
   step "Checking for updates"
@@ -780,7 +780,7 @@ if [[ "$LIST_MODE" == true ]]; then
   fi
 
   step "Reading entries"
-  TOTAL="$(grep -c '' "$REGISTRY" 2>/dev/null || echo 0)"
+  TOTAL="$(grep -c '' "$REGISTRY" 2>/dev/null || true)"
   if [[ "$TOTAL" -eq 0 ]]; then
     warn "Registry is empty — no managed installs recorded."
     echo ""
@@ -1128,7 +1128,7 @@ if [[ "$REMOVE_MODE" == true ]]; then
   registry_remove_entry "$NAME"
   spinner_stop
   ok "Registry entry removed"
-  REMAINING="$(grep -c '' "$REGISTRY" 2>/dev/null || echo 0)"
+  REMAINING="$(grep -c '' "$REGISTRY" 2>/dev/null || true)"
   info "${REMAINING} install(s) remaining in registry"
 
   # ── summary ─────────────────────────────────────────────────────────────
