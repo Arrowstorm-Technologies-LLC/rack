@@ -33,24 +33,26 @@ usage() {
   echo -e "${BOLD}rack${RESET} — install and remove GitHub binaries by name"
   echo ""
   echo -e "${BOLD}Usage:${RESET}"
-  echo -e "  rack ${CYAN}[-a]${RESET} ${CYAN}<name> <url|slug>${RESET}  Download and install a binary"
-  echo -e "  rack ${CYAN}-u${RESET} ${CYAN}<name> [url|slug]${RESET} Update a managed binary (optionally from new URL or slug)"
-  echo -e "  rack ${CYAN}-r${RESET} ${CYAN}<name> <index>${RESET}   Roll back to a previously recorded URL"
-  echo -e "  rack ${CYAN}-H${RESET} ${CYAN}<name>${RESET}           Show URL history for a managed binary"
-  echo -e "  rack ${CYAN}-R${RESET} ${CYAN}<name>${RESET}            Remove a managed install"
-  echo -e "  rack ${CYAN}-l${RESET}                    List all managed installs"
-  echo -e "  rack ${CYAN}update${RESET}               Check for and apply updates for all managed installs"
+  echo -e "  rack ${CYAN}[-a] [-A arch]${RESET} ${CYAN}<name> <url|slug>${RESET}  Download and install a binary"
+  echo -e "  rack ${CYAN}-u${RESET} ${CYAN}<name> [url|slug]${RESET}          Update a managed binary (optionally from new URL or slug)"
+  echo -e "  rack ${CYAN}-r${RESET} ${CYAN}<name> <index>${RESET}              Roll back to a previously recorded URL"
+  echo -e "  rack ${CYAN}-H${RESET} ${CYAN}<name>${RESET}                      Show URL history for a managed binary"
+  echo -e "  rack ${CYAN}-R${RESET} ${CYAN}<name>${RESET}                      Remove a managed install"
+  echo -e "  rack ${CYAN}-l${RESET}                             List all managed installs"
+  echo -e "  rack ${CYAN}update [-y]${RESET}                   Check for and apply updates for all managed installs"
   echo ""
   echo -e "${BOLD}Flags:${RESET}"
-  echo -e "  ${CYAN}-a${RESET}   Extract archive and find binary named <name> inside"
-  echo -e "  ${CYAN}-u${RESET}   Update binary from its recorded source URL (or a new one)"
-  echo -e "  ${CYAN}-r${RESET}   Roll back to a URL from history by index (see rack -H <name>)"
-  echo -e "  ${CYAN}-H${RESET}   Show numbered URL history for a binary"
-  echo -e "  ${CYAN}-R${RESET}   Remove the named binary from the install dir"
-  echo -e "  ${CYAN}-l${RESET}   List everything managed by rack"
+  echo -e "  ${CYAN}-a${RESET}         Extract archive and find binary named <name> inside"
+  echo -e "  ${CYAN}-A${RESET} ${CYAN}<arch>${RESET}  Override arch filter (default: auto-detect from uname -m)"
+  echo -e "  ${CYAN}-y${RESET}         Auto-confirm prompts (useful for scripting rack update)"
+  echo -e "  ${CYAN}-u${RESET}         Update binary from its recorded source URL (or a new one)"
+  echo -e "  ${CYAN}-r${RESET}         Roll back to a URL from history by index (see rack -H <name>)"
+  echo -e "  ${CYAN}-H${RESET}         Show numbered URL history for a binary"
+  echo -e "  ${CYAN}-R${RESET}         Remove the named binary from the install dir"
+  echo -e "  ${CYAN}-l${RESET}         List everything managed by rack"
   echo ""
   echo -e "  Supported archives: .tar.gz  .tgz  .tar.bz2  .tar.xz  .zip"
-  echo -e "  GitHub slugs:  ${DIM}owner/repo${RESET}  ${DIM}(resolves latest release)${RESET}"
+  echo -e "  GitHub slugs:  ${DIM}owner/repo${RESET}  ${DIM}(resolves latest release, auto-filters assets by platform)${RESET}"
   echo -e "                 ${DIM}repo-name${RESET}    ${DIM}(searches GitHub, then resolves)${RESET}"
   echo -e "  Install dir:   ${DIM}${INSTALL_DIR}${RESET}"
   echo -e "  Registry:      ${DIM}${REGISTRY}${RESET}"
@@ -276,6 +278,17 @@ _gh_resolve_release() {
     return
   fi
 
+  # Auto-filter assets to the current platform before presenting the picker
+  if [[ "${#ASSET_URLS[@]}" -gt 1 ]]; then
+    _filter_assets "${ASSET_URLS[@]}"
+    if [[ "${#_FILTERED_ASSETS[@]}" -gt 0 && "${#_FILTERED_ASSETS[@]}" -lt "${#ASSET_URLS[@]}" ]]; then
+      info "Platform filter ($(uname -m)/$(uname -s | tr '[:upper:]' '[:lower:]')): ${#ASSET_URLS[@]} → ${#_FILTERED_ASSETS[@]} asset(s)"
+      ASSET_URLS=("${_FILTERED_ASSETS[@]}")
+    elif [[ "${#_FILTERED_ASSETS[@]}" -eq 0 ]]; then
+      warn "No assets matched current platform — showing all ${#ASSET_URLS[@]}"
+    fi
+  fi
+
   if [[ "${#ASSET_URLS[@]}" -eq 1 ]]; then
     URL="${ASSET_URLS[0]}"
     ok "Single asset: $(basename "$URL")"
@@ -386,6 +399,70 @@ _gh_latest_tag_for_slug() {
   printf '%s\n' "$tag"
 }
 
+# ── asset platform filtering ──────────────────────────────────────────────────
+# Populates global _FILTERED_ASSETS from the URLs passed as arguments.
+# Matches assets whose filename contains both an arch token and an OS token for
+# the current platform (overridable with ARCH_FILTER). On Linux, musl builds are
+# preferred over gnu when both are present.
+
+_FILTERED_ASSETS=()
+
+_filter_assets() {
+  _FILTERED_ASSETS=()
+  local _arch _os
+  _arch="$(uname -m 2>/dev/null || true)"
+  _os="$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+
+  local -a _arch_pats _os_pats
+  if [[ -n "${ARCH_FILTER:-}" ]]; then
+    _arch_pats=("$ARCH_FILTER")
+  else
+    case "$_arch" in
+      x86_64)  _arch_pats=(x86_64 amd64) ;;
+      aarch64) _arch_pats=(aarch64 arm64) ;;
+      armv7l)  _arch_pats=(armv7 armhf arm) ;;
+      i686)    _arch_pats=(i686 i386 386) ;;
+      *)       _arch_pats=("$_arch") ;;
+    esac
+  fi
+  case "$_os" in
+    linux)  _os_pats=(linux) ;;
+    darwin) _os_pats=(darwin macos) ;;
+    *)      _os_pats=("$_os") ;;
+  esac
+
+  local _url _fname _ap _op _am _om
+  for _url in "$@"; do
+    _fname="$(basename "$_url" | tr '[:upper:]' '[:lower:]')"
+    _am=false; for _ap in "${_arch_pats[@]}"; do [[ "$_fname" == *"$_ap"* ]] && { _am=true; break; }; done
+    _om=false; for _op in "${_os_pats[@]}";   do [[ "$_fname" == *"$_op"* ]] && { _om=true; break; }; done
+    [[ "$_am" == true && "$_om" == true ]] && _FILTERED_ASSETS+=("$_url")
+  done
+
+  # Prefer musl over gnu on Linux for static portability
+  if [[ "$_os" == "linux" && "${#_FILTERED_ASSETS[@]}" -gt 1 ]]; then
+    local -a _musl=()
+    for _url in "${_FILTERED_ASSETS[@]}"; do
+      [[ "$(basename "$_url" | tr '[:upper:]' '[:lower:]')" == *musl* ]] && _musl+=("$_url")
+    done
+    [[ "${#_musl[@]}" -gt 0 ]] && _FILTERED_ASSETS=("${_musl[@]}")
+  fi
+
+  # Prefer portable archives (.tar.gz .tar.xz .tar.bz2 .tgz .zip) over
+  # system package formats (.deb .rpm .apk) — rack installs raw binaries
+  if [[ "${#_FILTERED_ASSETS[@]}" -gt 1 ]]; then
+    local -a _archives=()
+    local _af
+    for _url in "${_FILTERED_ASSETS[@]}"; do
+      _af="$(basename "$_url" | tr '[:upper:]' '[:lower:]')"
+      case "$_af" in
+        *.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.zip) _archives+=("$_url") ;;
+      esac
+    done
+    [[ "${#_archives[@]}" -gt 0 ]] && _FILTERED_ASSETS=("${_archives[@]}")
+  fi
+}
+
 # Select the correct asset for an update. Tries to auto-match by replacing the old tag
 # in the current filename; falls back to interactive picker if the filename changed.
 # Sets global URL and ARCHIVE_MODE.
@@ -425,19 +502,27 @@ _gh_select_update_asset() {
       URL="$matched"
       ok "Auto-matched: $(basename "$URL")"
     else
-      step "Select asset for '${slug}' ${new_tag}"
-      info "Asset filename changed — please select manually:"
-      echo ""
-      [[ -t 0 ]] || die "Asset selection requires an interactive terminal."
-      local -a basenames=()
-      for u in "${ASSET_URLS[@]}"; do
-        basenames+=("$(basename "$u")")
-      done
-      _pick_numbered "Asset number:" "${basenames[@]}"
-      for u in "${ASSET_URLS[@]}"; do
-        [[ "$(basename "$u")" == "$PICK_RESULT" ]] && { URL="$u"; break; }
-      done
-      ok "Selected: $(basename "$URL")"
+      # Tag-substitution match failed; try platform filter before falling back to picker
+      _filter_assets "${ASSET_URLS[@]}"
+      if [[ "${#_FILTERED_ASSETS[@]}" -eq 1 ]]; then
+        URL="${_FILTERED_ASSETS[0]}"
+        ok "Platform-matched: $(basename "$URL")"
+      else
+        [[ "${#_FILTERED_ASSETS[@]}" -gt 1 ]] && ASSET_URLS=("${_FILTERED_ASSETS[@]}")
+        step "Select asset for '${slug}' ${new_tag}"
+        info "Asset filename changed — please select manually:"
+        echo ""
+        [[ -t 0 ]] || die "Asset selection requires an interactive terminal."
+        local -a basenames=()
+        for u in "${ASSET_URLS[@]}"; do
+          basenames+=("$(basename "$u")")
+        done
+        _pick_numbered "Asset number:" "${basenames[@]}"
+        for u in "${ASSET_URLS[@]}"; do
+          [[ "$(basename "$u")" == "$PICK_RESULT" ]] && { URL="$u"; break; }
+        done
+        ok "Selected: $(basename "$URL")"
+      fi
     fi
   fi
 
@@ -625,8 +710,13 @@ _do_install() {
   ok "Registered: ${REGISTRY}"
 }
 
+# ── global option defaults (must precede 'rack update' block) ─────────────────
+YES_MODE=false
+ARCH_FILTER=""
+
 # ── 'rack update' subcommand ─────────────────────────────────────────────────
 if [[ "${1:-}" == "update" ]]; then
+  for _upd_arg in "${@:2}"; do [[ "$_upd_arg" == "-y" || "$_upd_arg" == "--yes" ]] && YES_MODE=true; done
   echo -e "\n${BOLD}rack update — checking managed installs for updates${RESET}"
 
   step "Loading registry"
@@ -715,18 +805,21 @@ if [[ "${1:-}" == "update" ]]; then
     && echo -e "   ${DIM}${SKIP_COUNT} skipped (non-GitHub or unresolvable).${RESET}"
   echo ""
 
-  if [[ ! -t 0 ]]; then
+  if [[ "$YES_MODE" == true ]]; then
+    ok "Auto-confirming (-y)"
+    CONFIRM="y"
+  elif [[ ! -t 0 ]]; then
     echo -e "   ${DIM}Non-interactive — skipping update prompt.${RESET}"
     echo ""
     exit 0
+  else
+    echo -en "   ${BOLD}Apply all updates? [y/N]${RESET} "
+    read -r CONFIRM < /dev/tty
+    [[ "$CONFIRM" =~ ^[Yy]$ ]] || {
+      echo -e "\n   ${DIM}Aborted. Nothing was changed.${RESET}\n"
+      exit 0
+    }
   fi
-
-  echo -en "   ${BOLD}Apply all updates? [y/N]${RESET} "
-  read -r CONFIRM
-  [[ "$CONFIRM" =~ ^[Yy]$ ]] || {
-    echo -e "\n   ${DIM}Aborted. Nothing was changed.${RESET}\n"
-    exit 0
-  }
 
   for i in "${!UPD_NAMES[@]}"; do
     NAME="${UPD_NAMES[$i]}"
@@ -767,15 +860,18 @@ LIST_MODE=false
 UPDATE_MODE=false
 ROLLBACK_MODE=false
 HISTORY_MODE=false
+# YES_MODE and ARCH_FILTER already initialised above
 
-while getopts ":aRluHr" opt; do
+while getopts ":aRluHrA:y" opt; do
   case $opt in
     a) ARCHIVE_MODE=true ;;
+    A) ARCH_FILTER="$OPTARG" ;;
     R) REMOVE_MODE=true ;;
     l) LIST_MODE=true ;;
     u) UPDATE_MODE=true ;;
     r) ROLLBACK_MODE=true ;;
     H) HISTORY_MODE=true ;;
+    y) YES_MODE=true ;;
     *) usage ;;
   esac
 done

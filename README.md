@@ -5,11 +5,11 @@ The Linux ecosystem is full of useful utilities that never make it into mainstre
 rack is the result of that frustration. It's a single Bash script that installs any binary from a GitHub release by a name you choose, tracks where it came from, and lets you update or remove it later — without a daemon, a package database, or anything beyond what ships on a base Linux install.
 
 ```
-rack bat sharkdp/bat                    # resolve latest release, pick an asset
+rack bat sharkdp/bat                    # resolve latest release, auto-select asset for current platform
 rack fd fd-find/fd                      # same for fd
 rack nvm https://github.com/nvm-sh/nvm # no binary assets? falls back to source archive + runs installer
 rack -u bat                             # update bat from its recorded source
-rack update                             # check and apply updates for everything
+rack update -y                          # check and apply all updates, no prompt
 rack -l                                 # list all managed installs
 ```
 
@@ -40,13 +40,19 @@ rack update                   Check for and apply updates for all managed instal
 
 ### Installing a binary
 
-Pass a GitHub slug, a full repo URL, or a direct release download URL — rack fetches the latest release and lets you pick an asset if there are multiple:
+Pass a GitHub slug, a full repo URL, or a direct release download URL — rack fetches the latest release and auto-selects an asset for the current platform. If more than one asset matches after filtering, an interactive picker is shown.
 
 ```sh
-rack bat sharkdp/bat                          # owner/repo slug
+rack bat sharkdp/bat                          # owner/repo slug — auto-selects asset for your arch/OS
 rack rg ripgrep                               # bare repo name, searches GitHub
 rack hx https://github.com/helix-editor/helix # full repo URL (same as owner/repo slug)
 rack hx https://github.com/helix-editor/helix/releases/download/24.07.1/helix-24.07.1-x86_64-linux.tar.xz
+```
+
+Use `-A <pattern>` to override the auto-detected architecture filter:
+
+```sh
+rack -A arm64 bat sharkdp/bat    # force arm64 asset selection
 ```
 
 Use `-a` if the URL points to an archive and rack can't auto-detect it (it usually can):
@@ -84,6 +90,7 @@ Because installer scripts control their own destination, installs run this way a
 rack -u bat           # re-download from the recorded URL
 rack -u bat cli/cli   # re-download from a new slug instead
 rack update           # check all managed installs and apply available updates
+rack update -y        # same, but skip the confirmation prompt (scriptable)
 ```
 
 ### Rollback
@@ -103,7 +110,9 @@ rack -R bat
 
 rack keeps a tab-separated registry at `~/.local/share/rack/registry.tsv` and a URL history file at `~/.local/share/rack/history.tsv`. Each install records the binary name, source URL, install path, and timestamp.
 
-When given a GitHub slug or repo URL, rack calls the GitHub releases API to resolve the latest release and presents a numbered asset picker. If the release has no binary assets, rack falls back to the release's source tarball, extracts it, and classifies the candidate file to decide whether to install it to PATH or run it as an installer script.
+When given a GitHub slug or repo URL, rack calls the GitHub releases API to resolve the latest release. Before presenting the asset picker, it filters candidates to those matching the current platform (`uname -m` / `uname -s`), preferring musl over gnu builds on Linux and portable archives (`.tar.gz`, `.zip`, etc.) over package formats (`.deb`, `.rpm`). If filtering leaves exactly one asset, it is selected automatically; otherwise the picker is shown with the filtered list. Use `-A <pattern>` to override arch detection, or pass a direct download URL to bypass resolution entirely.
+
+If the release has no binary assets, rack falls back to the release's source tarball, extracts it, and classifies the candidate file to decide whether to install it to PATH or run it as an installer script.
 
 `rack update` queries the API for every managed install, compares the tag in the stored URL against the latest release tag, and applies updates with automatic asset matching (falls back to the picker if the upstream filename format changed).
 
