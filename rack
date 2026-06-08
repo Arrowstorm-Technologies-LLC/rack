@@ -994,6 +994,10 @@ if [[ "$UPDATE_MODE" == true ]]; then
         github_resolve_slug "${BASH_REMATCH[1]}"
       else
         URL="$ALT_URL"
+        if [[ "$ARCHIVE_MODE" == false ]]; then
+          _fname="${URL##*/}"; _fname="${_fname%%\?*}"
+          case "$_fname" in *.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.zip) ARCHIVE_MODE=true ;; esac
+        fi
       fi
     else
       github_resolve_slug "$ALT_URL"
@@ -1155,6 +1159,10 @@ if [[ "$URL" =~ ^https?:// ]]; then
     github_resolve_slug "${BASH_REMATCH[1]}"
   else
     ok "URL:   ${URL}"
+    if [[ "$ARCHIVE_MODE" == false ]]; then
+      _fname="${URL##*/}"; _fname="${_fname%%\?*}"
+      case "$_fname" in *.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.zip) ARCHIVE_MODE=true ;; esac
+    fi
   fi
 elif [[ -n "$URL" ]]; then
   github_resolve_slug "$URL"
