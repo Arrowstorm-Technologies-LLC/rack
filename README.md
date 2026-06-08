@@ -5,11 +5,12 @@ The Linux ecosystem is full of useful utilities that never make it into mainstre
 rack is the result of that frustration. It's a single Bash script that installs any binary from a GitHub release by a name you choose, tracks where it came from, and lets you update or remove it later — without a daemon, a package database, or anything beyond what ships on a base Linux install.
 
 ```
-rack bat sharkdp/bat          # resolve latest release, pick an asset
-rack fd fd-find/fd            # same for fd
-rack -u bat                   # update bat from its recorded source
-rack update                   # check and apply updates for everything
-rack -l                       # list all managed installs
+rack bat sharkdp/bat                    # resolve latest release, pick an asset
+rack fd fd-find/fd                      # same for fd
+rack nvm https://github.com/nvm-sh/nvm # no binary assets? falls back to source archive + runs installer
+rack -u bat                             # update bat from its recorded source
+rack update                             # check and apply updates for everything
+rack -l                                 # list all managed installs
 ```
 
 ## Install
@@ -39,11 +40,12 @@ rack update                   Check for and apply updates for all managed instal
 
 ### Installing a binary
 
-Pass a full release URL or a GitHub slug — rack fetches the latest release and lets you pick an asset if there are multiple:
+Pass a GitHub slug, a full repo URL, or a direct release download URL — rack fetches the latest release and lets you pick an asset if there are multiple:
 
 ```sh
 rack bat sharkdp/bat                          # owner/repo slug
 rack rg ripgrep                               # bare repo name, searches GitHub
+rack hx https://github.com/helix-editor/helix # full repo URL (same as owner/repo slug)
 rack hx https://github.com/helix-editor/helix/releases/download/24.07.1/helix-24.07.1-x86_64-linux.tar.xz
 ```
 
@@ -52,6 +54,29 @@ Use `-a` if the URL points to an archive and rack can't auto-detect it (it usual
 ```sh
 rack -a mytool https://example.com/mytool-linux.tar.gz
 ```
+
+### Source archive fallback and installer scripts
+
+Some tools don't ship pre-built binaries as release assets — they distribute a shell installer that handles the installation itself (nvm, oh-my-zsh, and similar tools). rack handles these automatically.
+
+When a release has no downloadable binary assets, rack falls back to the GitHub-generated source tarball for that release tag and searches it for a recognisable installer script (`install.sh`, `setup.sh`, `bootstrap.sh`, etc.). If found, rack prompts you to run it:
+
+```sh
+rack nvm https://github.com/nvm-sh/nvm
+# → no release assets found, falls back to source archive
+# → finds install.sh, classifies it as installer
+# → Run installer? [Y/n]
+# → runs bash install.sh from its own directory
+```
+
+When the source archive contains a plain script (shebang, but no installer behaviour) or an ELF binary, rack installs it to the install dir as usual.
+
+**Classification heuristics** (in priority order):
+1. **Filename** — `install.sh`, `setup.sh`, `bootstrap.sh`, `installer.sh`, `install`, `setup` → installer
+2. **Magic bytes** — ELF header (`7f 45 4c 46`) → binary
+3. **Content** — shebang present and file modifies shell profiles or installs into `$HOME` → installer; otherwise → script (installed to PATH)
+
+Because installer scripts control their own destination, installs run this way are **not registered** in rack's registry and cannot be updated or rolled back via rack.
 
 ### Updating
 
@@ -78,7 +103,9 @@ rack -R bat
 
 rack keeps a tab-separated registry at `~/.local/share/rack/registry.tsv` and a URL history file at `~/.local/share/rack/history.tsv`. Each install records the binary name, source URL, install path, and timestamp.
 
-When given a GitHub slug, rack calls the GitHub releases API to resolve the latest release and presents a numbered asset picker. `rack update` queries the API for every managed install, compares the tag in the stored URL against the latest release tag, and applies updates with automatic asset matching (falls back to the picker if the upstream filename format changed).
+When given a GitHub slug or repo URL, rack calls the GitHub releases API to resolve the latest release and presents a numbered asset picker. If the release has no binary assets, rack falls back to the release's source tarball, extracts it, and classifies the candidate file to decide whether to install it to PATH or run it as an installer script.
+
+`rack update` queries the API for every managed install, compares the tag in the stored URL against the latest release tag, and applies updates with automatic asset matching (falls back to the picker if the upstream filename format changed).
 
 ## Configuration
 
@@ -90,8 +117,9 @@ When given a GitHub slug, rack calls the GitHub releases API to resolve the late
 
 ## Limitations
 
-- Only works with GitHub release assets. Arbitrary download pages are supported as direct URLs but won't benefit from slug resolution or update checks.
+- Arbitrary (non-GitHub) download URLs are supported but won't benefit from slug resolution, source archive fallback, or `rack update` checks.
 - Update checks require the source URL to contain a versioned release tag (e.g. `v1.2.3`). Binaries installed from tag-less URLs are skipped by `rack update`.
+- Installs performed by external installer scripts are not registered in rack's registry and cannot be updated or rolled back via rack.
 - The GitHub API is queried unauthenticated (60 requests/hour). Running `rack update` with many managed installs may hit this limit.
 
 ## Shell vs Python

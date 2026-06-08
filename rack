@@ -91,7 +91,7 @@ spinner_start() {
       char="${SPINNER_CHARS:$((i % ${#SPINNER_CHARS})):1}"
       printf "\r   ${CYAN}%s${RESET} %s..." "$char" "$SPINNER_MSG" >&2
       sleep 0.08
-      ((i++))
+      i=$(( i + 1 ))
     done
   ) &
   SPINNER_PID=$!
@@ -99,7 +99,7 @@ spinner_start() {
 
 spinner_stop() {
   if [[ -n "${SPINNER_PID:-}" ]]; then
-    kill "$SPINNER_PID" 2>/dev/null
+    kill "$SPINNER_PID" 2>/dev/null || true
     wait "$SPINNER_PID" 2>/dev/null || true
     printf "\r\033[K" >&2
     SPINNER_PID=""
@@ -107,6 +107,28 @@ spinner_stop() {
 }
 
 trap 'spinner_stop' EXIT
+
+# ── file classification ───────────────────────────────────────────────────────
+
+SOURCE_ARCHIVE=false
+
+_classify_file() {
+  local file="$1" fname
+  fname="$(basename "$file")"
+  # Installer by name
+  case "$fname" in
+    install.sh|setup.sh|bootstrap.sh|installer.sh|install|setup)
+      printf 'installer'; return ;;
+  esac
+  # ELF binary (magic bytes 7f 45 4c 46)
+  local magic
+  magic="$(od -An -N4 -tx1 "$file" 2>/dev/null | tr -d ' \n')"
+  [[ "$magic" == "7f454c46" ]] && { printf 'binary'; return; }
+  # Script: check shebang, then distinguish installer vs tool by content
+  head -c2 "$file" 2>/dev/null | grep -q $'#!' || { printf 'binary'; return; }
+  grep -qiE '\.(bashrc|zshrc|profile|bash_profile)|export [A-Z_]+=.*HOME|mkdir -p .*HOME' \
+    "$file" 2>/dev/null && printf 'installer' || printf 'script'
+}
 
 # ── registry helpers ──────────────────────────────────────────────────────────
 # Format: NAME <TAB> URL <TAB> INSTALL_PATH <TAB> TIMESTAMP
@@ -245,7 +267,13 @@ _gh_resolve_release() {
   rm -f "$json_file"
 
   if [[ "${#ASSET_URLS[@]}" -eq 0 ]]; then
-    die "Release '${tag}' for '${slug}' has no downloadable assets."
+    local _src_url="https://github.com/${slug}/archive/refs/tags/${tag}.tar.gz"
+    warn "No release assets found — falling back to source archive"
+    info "Source: ${_src_url}"
+    URL="$_src_url"
+    ARCHIVE_MODE=true
+    SOURCE_ARCHIVE=true
+    return
   fi
 
   if [[ "${#ASSET_URLS[@]}" -eq 1 ]]; then
@@ -486,13 +514,28 @@ _do_install() {
 
     step "Locating binary"
 
-    local binary
+    local binary=""
     spinner_start "Searching for '${NAME}'"
     binary="$(find "$extract_dir" -type f -name "$NAME" | head -n 1)"
     spinner_stop
 
     if [[ -n "$binary" ]]; then
       ok "Found exact match: ${binary#"$extract_dir"}"
+    elif [[ "$SOURCE_ARCHIVE" == true ]]; then
+      warn "No file named '${NAME}' found in source archive"
+      local _iname
+      for _iname in install.sh setup.sh bootstrap.sh installer.sh install setup; do
+        binary="$(find "$extract_dir" -type f -name "$_iname" | head -n 1)"
+        [[ -n "$binary" ]] && { info "Found: ${_iname}"; break; }
+      done
+      if [[ -z "$binary" ]]; then
+        warn "No installer script found — falling back to first executable..."
+        spinner_start "Scanning for executables"
+        binary="$(find "$extract_dir" -type f -perm /111 | head -n 1)"
+        spinner_stop
+        [[ -n "$binary" ]] || die "No executable found in source archive. You may need to inspect it manually."
+        warn "Using: $(basename "$binary")"
+      fi
     else
       warn "No file named '${NAME}' found — falling back to first executable..."
       spinner_start "Scanning for executables"
@@ -503,6 +546,33 @@ _do_install() {
         warn "Using: $(basename "$binary") → will be installed as '${NAME}'"
       else
         die "No executable binary found in archive. You may need to inspect it manually."
+      fi
+    fi
+
+    if [[ "$SOURCE_ARCHIVE" == true ]]; then
+      local _fclass
+      spinner_start "Classifying '$(basename "$binary")'"
+      _fclass="$(_classify_file "$binary")"
+      spinner_stop
+      ok "File type: ${_fclass}"
+
+      if [[ "$_fclass" == "installer" ]]; then
+        step "Installer script detected"
+        info "$(basename "$binary") manages its own installation"
+        echo ""
+        if [[ -t 0 ]]; then
+          echo -en "   ${BOLD}Run installer? [Y/n]${RESET} "
+          read -r _run_confirm < /dev/tty
+          [[ "$_run_confirm" =~ ^[Nn]$ ]] && { echo -e "\n   ${DIM}Aborted.${RESET}\n"; exit 0; }
+        fi
+        echo ""
+        chmod +x "$binary"
+        ( cd "$(dirname "$binary")" && bash "$(basename "$binary")" )
+        echo ""
+        echo -e "${GREEN}${BOLD}✔ Installer finished.${RESET}"
+        echo -e "   ${DIM}Note: rack cannot track or update installs run by external installer scripts.${RESET}"
+        echo ""
+        exit 0
       fi
     fi
 
@@ -653,6 +723,7 @@ if [[ "${1:-}" == "update" ]]; then
 
     step "Selecting asset"
     ARCHIVE_MODE=false
+    SOURCE_ARCHIVE=false
     _gh_select_update_asset "$SLUG" "$OLD_TAG" "$NEW_TAG" "$OLD_URL"
 
     step "Checking install directory"
@@ -673,6 +744,7 @@ fi
 
 # ── flag parsing ──────────────────────────────────────────────────────────────
 ARCHIVE_MODE=false
+SOURCE_ARCHIVE=false
 REMOVE_MODE=false
 LIST_MODE=false
 UPDATE_MODE=false
@@ -918,7 +990,11 @@ if [[ "$UPDATE_MODE" == true ]]; then
 
   if [[ -n "$ALT_URL" ]]; then
     if [[ "$ALT_URL" =~ ^https?:// ]]; then
-      URL="$ALT_URL"
+      if [[ "$ALT_URL" =~ ^https://github\.com/([a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+)/?$ ]]; then
+        github_resolve_slug "${BASH_REMATCH[1]}"
+      else
+        URL="$ALT_URL"
+      fi
     else
       github_resolve_slug "$ALT_URL"
     fi
@@ -1075,7 +1151,11 @@ step "Validating arguments"
 ok "Name:  ${NAME}"
 
 if [[ "$URL" =~ ^https?:// ]]; then
-  ok "URL:   ${URL}"
+  if [[ "$URL" =~ ^https://github\.com/([a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+)/?$ ]]; then
+    github_resolve_slug "${BASH_REMATCH[1]}"
+  else
+    ok "URL:   ${URL}"
+  fi
 elif [[ -n "$URL" ]]; then
   github_resolve_slug "$URL"
   ok "Resolved: ${URL}"
