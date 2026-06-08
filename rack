@@ -537,9 +537,26 @@ _do_install() {
         warn "Using: $(basename "$binary")"
       fi
     else
-      warn "No file named '${NAME}' found — falling back to first executable..."
+      warn "No file named '${NAME}' found — scanning for best match..."
       spinner_start "Scanning for executables"
-      binary="$(find "$extract_dir" -type f -perm /111 | head -n 1)"
+
+      # 1. Name-prefix match, excluding scripts and man pages (e.g. yq → yq_linux_amd64)
+      binary="$(find "$extract_dir" -type f -perm /111 -name "${NAME}*" \
+        ! -name "*.sh" ! -name "*.py" ! -name "*.rb" ! -name "*.1" | head -n 1)"
+
+      if [[ -z "$binary" ]]; then
+        # 2. Exclude installer scripts; prefer ELF binaries over plain scripts
+        local _f _magic
+        while IFS= read -r _f; do
+          _magic="$(od -An -N4 -tx1 "$_f" 2>/dev/null | tr -d ' \n')"
+          [[ "$_magic" == "7f454c46" ]] && { binary="$_f"; break; }
+        done < <(find "$extract_dir" -type f -perm /111 \
+          ! -name "install*" ! -name "setup*" ! -name "bootstrap*")
+        # 3. Any non-installer executable as last resort
+        [[ -z "$binary" ]] && binary="$(find "$extract_dir" -type f -perm /111 \
+          ! -name "install*" ! -name "setup*" ! -name "bootstrap*" | head -n 1)"
+      fi
+
       spinner_stop
 
       if [[ -n "$binary" ]]; then
