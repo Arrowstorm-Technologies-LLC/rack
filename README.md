@@ -155,7 +155,7 @@ rack is a lightweight personal binary registry with tracking, history, and rollb
 | bin       | Multi-provider manager        | Config   | Yes (update/remove/pin) | No              | Docker support too |
 | aqua      | Declarative version manager   | YAML registry | Yes (lazy, per-project) | Limited      | Team/CI focused, heavier |
 
-rack stays simple for personal use while adding the management layer the others lack.
+rack stays simple for personal use while adding the management layer the others lack. No central registry, no version pinning (unlike aqua), just ad-hoc tracking for your GitHub binaries.
 
 ## Shell vs Python
 
