@@ -10,6 +10,7 @@ rack fd fd-find/fd                      # same for fd
 rack nvm https://github.com/nvm-sh/nvm # no binary assets? falls back to source archive + runs installer
 rack -u bat                             # update bat from its recorded source
 rack update -y                          # check and apply all updates, no prompt
+rack update -n                          # dry-run to preview available updates
 rack -l                                 # list all managed installs
 ```
 
@@ -68,6 +69,8 @@ rack -n bat sharkdp/bat
 rack update -n -y
 ```
 
+Tool names must start with an alphanumeric character and can only contain letters, numbers, dots, dashes, and underscores. The characters `.`, `..`, names starting with `-`, or containing `/` are rejected early with a clear error.
+
 ### Source archive fallback and installer scripts
 
 Some tools don't ship pre-built binaries as release assets — they distribute a shell installer that handles the installation itself (nvm, oh-my-zsh, and similar tools). rack handles these automatically.
@@ -122,6 +125,8 @@ When given a GitHub slug or repo URL, rack calls the GitHub releases API to reso
 
 If the release has no binary assets, rack falls back to the release's source tarball, extracts it, and classifies the candidate file to decide whether to install it to PATH or run it as an installer script.
 
+Downloads are performed with the best available tool (curl or wget for Bash; urllib for Python). After a successful download, the SHA256 of the payload is computed and displayed to aid verification.
+
 `rack update` queries the API for every managed install, compares the tag in the stored URL against the latest release tag, and applies updates with automatic asset matching (falls back to the picker if the upstream filename format changed).
 
 ## Configuration
@@ -147,12 +152,9 @@ rack ships as two functionally identical scripts that share the same registry an
 
 **`rack.py`** (Python) was written to address that tradeoff directly. It uses Python's `json` module for proper API response parsing, `urllib` for HTTP (no `curl` or `wget` needed), and the standard `tarfile`/`zipfile` modules for archive extraction (no `tar` or `unzip` needed). This makes it more resilient to unexpected API responses and removes the dependency on external download tools entirely. The cost is Python 3.8+ as a requirement and a slightly slower startup (~50–150ms of import overhead vs. <5ms for Bash).
 
-In practice, both feel identical to use and now have full flag parity (including `-y` / `-n` for updates and dry-runs). The Python version is the better choice if you want robustness and easier extensibility; the Bash version is the better choice if you value a zero-dependency install or are on a minimal system.
+In practice, both feel identical to use. They now have full flag parity, including `-y` for non-interactive updates and `-n` for dry-runs. The Python version is the better choice if you want robustness and easier extensibility; the Bash version is the better choice if you value a zero-dependency install or are on a minimal system.
 
-Both versions now:
-* Use stricter name validation (reject `.`, `..`, names starting with `-`, containing `/`).
-* Log SHA256 of every downloaded payload.
-* Support `rack -n` / `rack.py -n` (dry run) and `rack update -y` / `rack.py update -y`.
+Both versions perform stricter name validation upfront, log the SHA256 of every downloaded payload for verification, and support `rack update -y` (and the equivalent with `rack.py`).
 
 ### Installing rack.py
 
@@ -168,28 +170,6 @@ Usage is identical — just substitute `rack.py` for `rack` in any command.
 **rack** (Bash): `bash`, `wget` or `curl`, `tar`, `unzip`, `find`, `du`, `date`, `mktemp`, `grep`, `cut`, `mv`, `sed` — all present on a base Arch/Linux install.
 
 **rack.py** (Python): `python3` (3.8+) — HTTP, JSON parsing, and archive extraction are handled by the standard library. No external tools required.
-
-## Name validation
-
-Managed names must:
-- Start with an alphanumeric character
-- Contain only `[a-zA-Z0-9._-]`
-- Not be exactly `.` or `..`
-- Not start with `-`
-- Not contain `/`
-
-Invalid names are rejected early by both `rack` and `rack.py`.
-
-## Verification / testing
-
-A basic smoke test is provided:
-
-```sh
-cd rack
-./test_basic.sh
-```
-
-It runs syntax checks, help, name validation, and dry-run acceptance.
 
 ## License
 
