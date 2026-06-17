@@ -144,6 +144,19 @@ Downloads are performed with the best available tool (curl or wget for Bash; url
 - Installs performed by external installer scripts are not registered in rack's registry and cannot be updated or rolled back via rack.
 - The GitHub API is queried unauthenticated (60 requests/hour). Running `rack update` with many managed installs may hit this limit.
 
+## Comparison to similar tools
+
+rack is a lightweight personal binary registry with tracking, history, and rollback.
+
+| Tool       | Focus                          | Tracking | Updates/Rollback | Source Fallback | Notes |
+|------------|--------------------------------|----------|------------------|-----------------|-------|
+| rack      | GitHub binaries + management  | Full registry + history | Yes (all + per, rollback) | Yes (tar + installers) | Bash + Py, dry-run, platform filters |
+| eget      | Simple fetch/extract          | None     | Basic upgrade    | Limited         | Fast one-off, good for CI |
+| bin       | Multi-provider manager        | Config   | Yes (update/remove/pin) | No              | Docker support too |
+| aqua      | Declarative version manager   | YAML registry | Yes (lazy, per-project) | Limited      | Team/CI focused, heavier |
+
+rack stays simple for personal use while adding the management layer the others lack.
+
 ## Shell vs Python
 
 rack ships as two functionally identical scripts that share the same registry and history files — you can use either interchangeably, or switch between them at any point without losing your install history.

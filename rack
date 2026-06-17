@@ -40,6 +40,8 @@ usage() {
   echo -e "  rack ${CYAN}-R${RESET} ${CYAN}<name>${RESET}                      Remove a managed install"
   echo -e "  rack ${CYAN}-l${RESET}                             List all managed installs"
   echo -e "  rack ${CYAN}update [-y]${RESET}                   Check for and apply updates for all managed installs"
+  echo -e "  rack ${CYAN}export [file]${RESET}                 Export registry (stdout or file)"
+  echo -e "  rack ${CYAN}import <file>${RESET}                 Import/merge registry from file"
   echo ""
   echo -e "${BOLD}Flags:${RESET}"
   echo -e "  ${CYAN}-a${RESET}         Extract archive and find binary named <name> inside"
@@ -193,6 +195,31 @@ registry_list() {
     printf "   ${GREEN}%-20s${RESET} ${DIM}%-25s${RESET} %s\n" "$name" "$timestamp" "$url"
   done < "$REGISTRY"
   echo ""
+}
+
+# ── export / import helpers ───────────────────────────────────────────────────
+rack_export() {
+  local outfile="$1"
+  registry_ensure
+  if [[ -z "$outfile" ]]; then
+    cat "$REGISTRY" 2>/dev/null || true
+  else
+    cp "$REGISTRY" "$outfile" 2>/dev/null || die "Failed to export to $outfile"
+    ok "Exported registry to $outfile"
+  fi
+}
+
+rack_import() {
+  local infile="$1"
+  [[ -f "$infile" ]] || die "Import file not found: $infile"
+  registry_ensure
+  # Simple merge: append non-dupe lines (by name)
+  while IFS=$'\t' read -r name url path ts; do
+    if ! grep -q $'^'"${name}"$'\t' "$REGISTRY" 2>/dev/null; then
+      echo -e "${name}\t${url}\t${path}\t${ts}" >> "$REGISTRY"
+    fi
+  done < "$infile"
+  ok "Imported/merged from $infile"
 }
 
 # ── history helpers ───────────────────────────────────────────────────────────
@@ -603,6 +630,28 @@ _do_install() {
   fi
   [[ -n "$sha256" ]] && info "SHA256: $sha256"
 
+  # ── automatic verification if companion hash available ───────────────────
+  if [[ -n "$sha256" ]]; then
+    local sha_url="${URL}.sha256"
+    local expected_sha=""
+    local tmp_sha="${TMPDIR_WORK}/$(basename "$URL").sha256"
+    if command -v wget &>/dev/null; then
+      wget -q -O "$tmp_sha" "$sha_url" 2>/dev/null || true
+    elif command -v curl &>/dev/null; then
+      curl -sL -o "$tmp_sha" "$sha_url" 2>/dev/null || true
+    fi
+    if [[ -f "$tmp_sha" ]]; then
+      expected_sha="$(cut -d' ' -f1 < "$tmp_sha" 2>/dev/null | tr -d '\n')"
+      if [[ "$expected_sha" == "$sha256" ]]; then
+        ok "SHA256 verified against ${URL}.sha256"
+      else
+        warn "SHA256 mismatch! Expected $expected_sha got $sha256"
+        # continue but warn; could die in strict mode but keep simple
+      fi
+    fi
+    rm -f "$tmp_sha" 2>/dev/null || true
+  fi
+
   # ── archive extraction ────────────────────────────────────────────────────
   if [[ "$ARCHIVE_MODE" == true ]]; then
     step "Extracting archive"
@@ -735,6 +784,12 @@ _do_install() {
   spinner_stop
   ok "Marked as executable"
 
+  # ── optional post-install hook ─────────────────────────────────────────────
+  local hook="$HOME/.config/rack/hooks/post-install"
+  if [[ -x "$hook" ]]; then
+    "$hook" "${INSTALL_DIR}/${NAME}" "$NAME" "$URL" || warn "post-install hook failed (non-fatal)"
+  fi
+
   # ── registry & history ─────────────────────────────────────────────────────
   step "Updating registry"
   local _cur_entry _cur_url
@@ -809,6 +864,15 @@ if [[ "${1:-}" == "update" ]]; then
       continue
     }
     spinner_stop
+
+    # Fetch release notes for better diffing (simple body)
+    local notes=""
+    if command -v curl &>/dev/null; then
+      notes=$(curl -s -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${slug}/releases/tags/${latest_tag}" 2>/dev/null | \
+        grep -o '"body": *"[^"]*"' | head -1 | cut -d'"' -f4 | head -c 200 || true)
+    fi
+    [[ -n "$notes" ]] && info "Release notes: ${notes}..." || true
 
     if [[ "$latest_tag" == "$cur_tag" ]]; then
       printf "   ${GREEN}✔${RESET}  %-20s ${DIM}${cur_tag} — up to date${RESET}\n" "$reg_name"
@@ -929,6 +993,16 @@ while getopts ":aRluHrA:yn" opt; do
   esac
 done
 shift $((OPTIND - 1))
+
+# ── export / import subcommands (simple positional) ───────────────────────────
+if [[ "${1:-}" == "export" ]]; then
+  rack_export "${2:-}"
+  exit 0
+elif [[ "${1:-}" == "import" ]]; then
+  [[ -n "${2:-}" ]] || die "import requires file"
+  rack_import "$2"
+  exit 0
+fi
 
 # ── list mode ─────────────────────────────────────────────────────────────────
 if [[ "$LIST_MODE" == true ]]; then
