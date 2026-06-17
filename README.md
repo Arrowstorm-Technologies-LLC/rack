@@ -29,13 +29,13 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc  # or ~/.zshrc
 ## Usage
 
 ```
-rack [-a] <name> <url|slug>   Install a binary
-rack -u  <name> [url|slug]    Update a managed binary (optionally from a new URL or slug)
-rack -r  <name> <index>       Roll back to a previously recorded URL
-rack -H  <name>               Show URL history for a managed binary
-rack -R  <name>               Remove a managed install
-rack -l                       List all managed installs
-rack update                   Check for and apply updates for all managed installs
+rack [-a] [-n] <name> <url|slug>   Install a binary (use -n for dry-run)
+rack -u  <name> [url|slug]         Update a managed binary (optionally from a new URL or slug)
+rack -r  <name> <index>            Roll back to a previously recorded URL
+rack -H  <name>                    Show URL history for a managed binary
+rack -R  <name>                    Remove a managed install
+rack -l                            List all managed installs
+rack update [-y] [-n]              Check for and apply updates ( -y = no prompt, -n = dry-run)
 ```
 
 ### Installing a binary
@@ -59,6 +59,13 @@ Use `-a` if the URL points to an archive and rack can't auto-detect it (it usual
 
 ```sh
 rack -a mytool https://example.com/mytool-linux.tar.gz
+```
+
+Use `-n` / `--dry-run` (or `-n` with `rack update`) to preview actions without downloading or writing anything:
+
+```sh
+rack -n bat sharkdp/bat
+rack update -n -y
 ```
 
 ### Source archive fallback and installer scripts
@@ -91,6 +98,7 @@ rack -u bat           # re-download from the recorded URL
 rack -u bat cli/cli   # re-download from a new slug instead
 rack update           # check all managed installs and apply available updates
 rack update -y        # same, but skip the confirmation prompt (scriptable)
+rack update -n        # dry-run: show what would be updated
 ```
 
 ### Rollback
@@ -139,7 +147,12 @@ rack ships as two functionally identical scripts that share the same registry an
 
 **`rack.py`** (Python) was written to address that tradeoff directly. It uses Python's `json` module for proper API response parsing, `urllib` for HTTP (no `curl` or `wget` needed), and the standard `tarfile`/`zipfile` modules for archive extraction (no `tar` or `unzip` needed). This makes it more resilient to unexpected API responses and removes the dependency on external download tools entirely. The cost is Python 3.8+ as a requirement and a slightly slower startup (~50–150ms of import overhead vs. <5ms for Bash).
 
-In practice, both feel identical to use. The Python version is the better choice if you want robustness and easier extensibility; the Bash version is the better choice if you value a zero-dependency install or are on a minimal system.
+In practice, both feel identical to use and now have full flag parity (including `-y` / `-n` for updates and dry-runs). The Python version is the better choice if you want robustness and easier extensibility; the Bash version is the better choice if you value a zero-dependency install or are on a minimal system.
+
+Both versions now:
+* Use stricter name validation (reject `.`, `..`, names starting with `-`, containing `/`).
+* Log SHA256 of every downloaded payload.
+* Support `rack -n` / `rack.py -n` (dry run) and `rack update -y` / `rack.py update -y`.
 
 ### Installing rack.py
 
@@ -155,6 +168,28 @@ Usage is identical — just substitute `rack.py` for `rack` in any command.
 **rack** (Bash): `bash`, `wget` or `curl`, `tar`, `unzip`, `find`, `du`, `date`, `mktemp`, `grep`, `cut`, `mv`, `sed` — all present on a base Arch/Linux install.
 
 **rack.py** (Python): `python3` (3.8+) — HTTP, JSON parsing, and archive extraction are handled by the standard library. No external tools required.
+
+## Name validation
+
+Managed names must:
+- Start with an alphanumeric character
+- Contain only `[a-zA-Z0-9._-]`
+- Not be exactly `.` or `..`
+- Not start with `-`
+- Not contain `/`
+
+Invalid names are rejected early by both `rack` and `rack.py`.
+
+## Verification / testing
+
+A basic smoke test is provided:
+
+```sh
+cd rack
+./test_basic.sh
+```
+
+It runs syntax checks, help, name validation, and dry-run acceptance.
 
 ## License
 

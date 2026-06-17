@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""rack.py — personal binary manager for GitHub releases (Python variant)"""
+"""rack.py — personal binary manager for GitHub releases (Python variant)
+Supports same commands + flags as the Bash version (including -y / -n).
+"""
 
+import hashlib
 import itertools
 import json
 import os
@@ -26,7 +29,7 @@ HISTORY     = Path(os.environ.get('RACK_HISTORY',  '~/.local/share/rack/history.
 
 GH_HEADERS   = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
 ARCHIVE_EXTS = ('.tar.gz', '.tgz', '.tar.bz2', '.tar.xz', '.zip')
-NAME_RE      = re.compile(r'^[a-zA-Z0-9._-]+$')
+NAME_RE      = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$')
 
 # ── colors ────────────────────────────────────────────────────────────────────
 if sys.stdout.isatty():
@@ -279,6 +282,10 @@ def download(url, dest):
     size_str = f'{size/1048576:.1f}M' if size >= 1048576 else f'{size/1024:.0f}K'
     ok(f'Download complete ({size_str})')
 
+    # Log SHA256 of downloaded payload for verification / audit
+    sha = hashlib.sha256(Path(dest).read_bytes()).hexdigest()
+    info(f'SHA256: {sha}')
+
 # ── archive extraction ────────────────────────────────────────────────────────
 def extract_archive(archive_path, extract_dir):
     step('Extracting archive')
@@ -335,8 +342,16 @@ def find_binary(extract_dir, name):
     return None
 
 # ── install core ──────────────────────────────────────────────────────────────
-def do_install(name, url, archive_mode):
+def do_install(name, url, archive_mode, dry_run=False):
     archive_name = url.split('/')[-1].split('?')[0]
+
+    if dry_run:
+        step('Dry run — no downloads or filesystem changes will be performed')
+        info(f'Would fetch: {url}')
+        info(f'Would install: {INSTALL_DIR / name}')
+        ok(f"Mode: {'archive extraction' if archive_mode else 'direct binary'}")
+        ok('Dry run complete (no changes made)')
+        return
 
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir  = Path(tmp)
@@ -384,10 +399,13 @@ def do_install(name, url, archive_mode):
 
 # ── commands ──────────────────────────────────────────────────────────────────
 def validate_name(name):
-    if not NAME_RE.match(name):
-        die(f"Invalid name '{name}'. Use only letters, numbers, dots, dashes, underscores.")
+    if not name or name in ('.', '..') or '/' in name or not NAME_RE.match(name):
+        die(f"Invalid name '{name}'. Use only letters, numbers, dots, dashes, underscores; must start with alphanum; reject '.' and '..'.")
+    # also reject leading dash explicitly (regex helps but be sure)
+    if name.startswith('-'):
+        die(f"Invalid name '{name}'. Names may not start with '-' .")
 
-def cmd_install(args, archive_mode):
+def cmd_install(args, archive_mode, dry_run=False):
     if len(args) < 2:
         usage(); sys.exit(1)
     name, url_or_slug = args[0], args[1]
@@ -421,14 +439,17 @@ def cmd_install(args, archive_mode):
         else:
             warn(f"'{name}' already exists at {INSTALL_DIR / name} — it will be overwritten.")
 
-    do_install(name, url, archive_mode)
+    do_install(name, url, archive_mode, dry_run)
 
-    print(f'\n{GREEN}{BOLD}✔ Done!{RESET}')
-    print(f'   Installed {BOLD}{name}{RESET} → {INSTALL_DIR / name}')
-    print(f'   Remove later with: {BOLD}rack.py -R {name}{RESET}')
-    print(f'   Run it with: {BOLD}{name}{RESET}\n')
+    if not dry_run:
+        print(f'\n{GREEN}{BOLD}✔ Done!{RESET}')
+        print(f'   Installed {BOLD}{name}{RESET} → {INSTALL_DIR / name}')
+        print(f'   Remove later with: {BOLD}rack.py -R {name}{RESET}')
+        print(f'   Run it with: {BOLD}{name}{RESET}\n')
+    else:
+        print(f'\n{YELLOW}{BOLD}Dry run complete — no changes made.{RESET}\n')
 
-def cmd_remove(args):
+def cmd_remove(args, dry_run=False):
     if not args:
         die('Remove mode requires a name. Usage: rack.py -R <name>')
     name = args[0]
@@ -488,6 +509,13 @@ def cmd_remove(args):
         ok('Confirmed')
     else:
         info('Non-interactive mode — skipping confirmation prompt')
+
+    if dry_run:
+        step('Dry run')
+        info(f'Would delete: {install_path}')
+        ok('Dry run — no changes made')
+        print(f'\n{YELLOW}{BOLD}Dry run complete — nothing removed.{RESET}\n')
+        return
 
     step('Removing binary')
     info(f'Deleting: {install_path}')
@@ -589,7 +617,7 @@ def cmd_history(args):
         print(f'   Roll back with: {BOLD}rack.py -r {name} <index>{RESET}')
     print()
 
-def cmd_rollback(args, archive_mode):
+def cmd_rollback(args, archive_mode, dry_run=False):
     if len(args) < 2:
         die('Rollback mode requires a name and index. Usage: rack.py -r <name> <index>')
     name, index_str = args[0], args[1]
@@ -638,13 +666,16 @@ def cmd_rollback(args, archive_mode):
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     ok(f'Install dir: {INSTALL_DIR}')
 
-    do_install(name, target_url, archive_mode)
+    do_install(name, target_url, archive_mode, dry_run)
 
-    print(f'\n{GREEN}{BOLD}✔ Done!{RESET}')
-    print(f'   {BOLD}{name}{RESET} rolled back to URL #{index} → {INSTALL_DIR / name}')
-    print(f'   Run it with: {BOLD}{name}{RESET}\n')
+    if not dry_run:
+        print(f'\n{GREEN}{BOLD}✔ Done!{RESET}')
+        print(f'   {BOLD}{name}{RESET} rolled back to URL #{index} → {INSTALL_DIR / name}')
+        print(f'   Run it with: {BOLD}{name}{RESET}\n')
+    else:
+        print(f'\n{YELLOW}{BOLD}Dry run complete — no changes made.{RESET}\n')
 
-def cmd_update_single(args, archive_mode):
+def cmd_update_single(args, archive_mode, dry_run=False):
     if not args:
         die('Update mode requires a name. Usage: rack.py -u <name> [new-url]')
     name = args[0]
@@ -685,15 +716,18 @@ def cmd_update_single(args, archive_mode):
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     ok(f'Install dir: {INSTALL_DIR}')
 
-    do_install(name, url, archive_mode)
+    do_install(name, url, archive_mode, dry_run)
 
-    print(f'\n{GREEN}{BOLD}✔ Done!{RESET}')
-    print(f'   {BOLD}{name}{RESET} has been updated → {INSTALL_DIR / name}')
-    if alt:
-        print('   Registry updated with new source URL.')
-    print(f'   Run it with: {BOLD}{name}{RESET}\n')
+    if not dry_run:
+        print(f'\n{GREEN}{BOLD}✔ Done!{RESET}')
+        print(f'   {BOLD}{name}{RESET} has been updated → {INSTALL_DIR / name}')
+        if alt:
+            print('   Registry updated with new source URL.')
+        print(f'   Run it with: {BOLD}{name}{RESET}\n')
+    else:
+        print(f'\n{YELLOW}{BOLD}Dry run complete — no changes made.{RESET}\n')
 
-def cmd_global_update():
+def cmd_global_update(yes_mode=False, dry_run=False):
     print(f'\n{BOLD}rack update — checking managed installs for updates{RESET}')
 
     step('Loading registry')
@@ -765,14 +799,22 @@ def cmd_global_update():
     if skipped:  print(f'   {DIM}{skipped} skipped (non-GitHub or unresolvable).{RESET}')
     print()
 
-    if not sys.stdin.isatty():
-        print(f'   {DIM}Non-interactive — skipping update prompt.{RESET}\n')
+    if dry_run:
+        print(f'{YELLOW}{BOLD}Dry run — the updates above would be applied (use without -n to proceed).{RESET}\n')
         return
 
-    ans = input(f'   {BOLD}Apply all updates? [y/N]{RESET} ').strip()
-    if ans.lower() != 'y':
-        print(f'\n   {DIM}Aborted. Nothing was changed.{RESET}\n')
+    if yes_mode:
+        ok('Auto-confirming (-y)')
+        proceed = True
+    elif not sys.stdin.isatty():
+        print(f'   {DIM}Non-interactive — skipping update prompt.{RESET}\n')
         return
+    else:
+        ans = input(f'   {BOLD}Apply all updates? [y/N]{RESET} ').strip()
+        proceed = ans.lower() == 'y'
+        if not proceed:
+            print(f'\n   {DIM}Aborted. Nothing was changed.{RESET}\n')
+            return
 
     for u in updates:
         name    = u['name']
@@ -810,7 +852,7 @@ def cmd_global_update():
         INSTALL_DIR.mkdir(parents=True, exist_ok=True)
         ok(f'Install dir: {INSTALL_DIR}')
 
-        do_install(name, url, archive_mode)
+        do_install(name, url, archive_mode, dry_run=False)  # apply only if we reached here
 
         print(f'\n   {GREEN}✔{RESET} {BOLD}{name}{RESET} updated  {DIM}{old_tag} → {CYAN}{new_tag}{RESET}')
 
@@ -827,7 +869,7 @@ def usage():
   rack.py {CYAN}-H <name>{RESET}              Show URL history for a managed binary
   rack.py {CYAN}-R <name>{RESET}              Remove a managed install
   rack.py {CYAN}-l{RESET}                     List all managed installs
-  rack.py {CYAN}update{RESET}                 Check for and apply updates for all managed installs
+  rack.py {CYAN}update [-y] [-n]{RESET}       Check for and apply updates for all managed installs
 
 {BOLD}Flags:{RESET}
   {CYAN}-a{RESET}   Extract archive and find binary named <name> inside
@@ -836,6 +878,8 @@ def usage():
   {CYAN}-H{RESET}   Show numbered URL history for a binary
   {CYAN}-R{RESET}   Remove the named binary from the install dir
   {CYAN}-l{RESET}   List everything managed by rack
+  {CYAN}-y{RESET}   Auto-confirm prompts (for rack.py update)
+  {CYAN}-n{RESET}   Dry-run: resolve and show plan but do not download or modify anything
 
   Supported archives: .tar.gz  .tgz  .tar.bz2  .tar.xz  .zip
   GitHub slugs:  {DIM}owner/repo{RESET}  {DIM}(resolves latest release){RESET}
@@ -855,7 +899,9 @@ def main():
         sys.exit(0 if args else 1)
 
     if args[0] == 'update':
-        cmd_global_update()
+        yes_mode = any(a in ('-y', '--yes') for a in args[1:])
+        dry_run = any(a in ('-n', '--dry-run') for a in args[1:])
+        cmd_global_update(yes_mode=yes_mode, dry_run=dry_run)
         return
 
     archive_mode  = False
@@ -864,6 +910,8 @@ def main():
     update_mode   = False
     rollback_mode = False
     history_mode  = False
+    yes_mode      = False
+    dry_run       = False
 
     i = 0
     while i < len(args) and args[i].startswith('-'):
@@ -874,6 +922,8 @@ def main():
         elif flag == '-u': update_mode   = True
         elif flag == '-r': rollback_mode = True
         elif flag == '-H': history_mode  = True
+        elif flag == '-y': yes_mode      = True
+        elif flag == '-n': dry_run       = True
         else:
             usage(); sys.exit(1)
         i += 1
@@ -882,10 +932,10 @@ def main():
 
     if   list_mode:     cmd_list()
     elif history_mode:  cmd_history(rest)
-    elif rollback_mode: cmd_rollback(rest, archive_mode)
-    elif update_mode:   cmd_update_single(rest, archive_mode)
-    elif remove_mode:   cmd_remove(rest)
-    else:               cmd_install(rest, archive_mode)
+    elif rollback_mode: cmd_rollback(rest, archive_mode, dry_run=dry_run)
+    elif update_mode:   cmd_update_single(rest, archive_mode, dry_run=dry_run)
+    elif remove_mode:   cmd_remove(rest, dry_run=dry_run)
+    else:               cmd_install(rest, archive_mode, dry_run=dry_run)
 
 if __name__ == '__main__':
     main()

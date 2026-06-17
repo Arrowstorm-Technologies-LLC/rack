@@ -7,7 +7,7 @@
 #   rack -H <name>                Show URL history for a managed binary
 #   rack -R <name>                Remove a previously installed binary
 #   rack -l                       List all managed installs
-#   rack update                   Check for and apply updates for all managed installs
+#   rack update [-y] [-n]         Check for and apply updates for all managed installs
 
 set -euo pipefail
 
@@ -45,6 +45,7 @@ usage() {
   echo -e "  ${CYAN}-a${RESET}         Extract archive and find binary named <name> inside"
   echo -e "  ${CYAN}-A${RESET} ${CYAN}<arch>${RESET}  Override arch filter (default: auto-detect from uname -m)"
   echo -e "  ${CYAN}-y${RESET}         Auto-confirm prompts (useful for scripting rack update)"
+  echo -e "  ${CYAN}-n${RESET}         Dry-run: resolve and plan but do not download or write anything"
   echo -e "  ${CYAN}-u${RESET}         Update binary from its recorded source URL (or a new one)"
   echo -e "  ${CYAN}-r${RESET}         Roll back to a URL from history by index (see rack -H <name>)"
   echo -e "  ${CYAN}-H${RESET}         Show numbered URL history for a binary"
@@ -83,6 +84,13 @@ warn() {
   echo -e "   ${YELLOW}⚠${RESET}  $*"
 }
 
+validate_name() {
+  local n="$1"
+  if [[ -z "$n" || "$n" == "." || "$n" == ".." || "$n" == -* || "$n" == */* || ! "$n" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+    die "Invalid name '${n}'. Use only letters, numbers, dots, dashes, underscores; must start with alphanum; reject '.' and '..'."
+  fi
+}
+
 spinner_start() {
   SPINNER_MSG="$1"
   SPINNER_CHARS='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
@@ -109,6 +117,14 @@ spinner_stop() {
 }
 
 trap 'spinner_stop' EXIT
+
+cleanup_temp() {
+  spinner_stop
+  if [[ -n "${TMPDIR_WORK:-}" && -d "$TMPDIR_WORK" ]]; then
+    rm -rf "$TMPDIR_WORK" 2>/dev/null || true
+    TMPDIR_WORK=""
+  fi
+}
 
 # ── file classification ───────────────────────────────────────────────────────
 
@@ -540,8 +556,18 @@ _do_install() {
   local archive_name="${URL##*/}"
   archive_name="${archive_name%%\?*}"
 
+  if [[ "${DRY_RUN:-false}" == true ]]; then
+    step "Dry run — no downloads or filesystem changes will be performed"
+    info "Would fetch: ${URL}"
+    info "Would install: ${INSTALL_DIR}/${NAME}"
+    [[ "$ARCHIVE_MODE" == true ]] && info "Archive mode: yes" || info "Direct binary mode"
+    ok "Dry run complete (no changes made)"
+    return 0
+  fi
+
   TMPDIR_WORK="$(mktemp -d)"
-  trap 'spinner_stop; rm -rf "$TMPDIR_WORK"' EXIT
+  # RETURN trap ensures per-function cleanup even in update loops; EXIT trap remains for whole-script spinner safety
+  trap 'cleanup_temp' RETURN
   local tmpfile="${TMPDIR_WORK}/${archive_name}"
 
   # ── download ─────────────────────────────────────────────────────────────
@@ -553,11 +579,13 @@ _do_install() {
   if command -v wget &>/dev/null; then
     info "Using wget"
     echo ""
-    wget --show-progress -q -O "$tmpfile" "$URL" && echo ""
+    wget --show-progress -q -O "$tmpfile" "$URL" || die "Download failed (wget) for ${URL}"
+    echo ""
   elif command -v curl &>/dev/null; then
     info "Using curl"
     echo ""
-    curl -L --progress-bar -o "$tmpfile" "$URL" && echo ""
+    curl -L --progress-bar -o "$tmpfile" "$URL" || die "Download failed (curl) for ${URL}"
+    echo ""
   else
     die "Neither wget nor curl found. Install one and try again."
   fi
@@ -565,6 +593,15 @@ _do_install() {
   local filesize
   filesize="$(du -sh "$tmpfile" 2>/dev/null | cut -f1)"
   ok "Download complete (${filesize})"
+
+  # Log SHA256 of what was downloaded (for manual verification / reproducibility)
+  local sha256=""
+  if command -v sha256sum &>/dev/null; then
+    sha256="$(sha256sum "$tmpfile" 2>/dev/null | cut -d' ' -f1 || true)"
+  elif command -v shasum &>/dev/null; then
+    sha256="$(shasum -a 256 "$tmpfile" 2>/dev/null | cut -d' ' -f1 || true)"
+  fi
+  [[ -n "$sha256" ]] && info "SHA256: $sha256"
 
   # ── archive extraction ────────────────────────────────────────────────────
   if [[ "$ARCHIVE_MODE" == true ]]; then
@@ -708,15 +745,22 @@ _do_install() {
   registry_add "$NAME" "$URL" "${INSTALL_DIR}/${NAME}"
   spinner_stop
   ok "Registered: ${REGISTRY}"
+
+  # Prompt cleanup on success path (RETURN trap also handles)
+  cleanup_temp
 }
 
 # ── global option defaults (must precede 'rack update' block) ─────────────────
 YES_MODE=false
+DRY_RUN=false
 ARCH_FILTER=""
 
 # ── 'rack update' subcommand ─────────────────────────────────────────────────
 if [[ "${1:-}" == "update" ]]; then
-  for _upd_arg in "${@:2}"; do [[ "$_upd_arg" == "-y" || "$_upd_arg" == "--yes" ]] && YES_MODE=true; done
+  for _upd_arg in "${@:2}"; do
+    [[ "$_upd_arg" == "-y" || "$_upd_arg" == "--yes" ]] && YES_MODE=true
+    [[ "$_upd_arg" == "-n" || "$_upd_arg" == "--dry-run" ]] && DRY_RUN=true
+  done
   echo -e "\n${BOLD}rack update — checking managed installs for updates${RESET}"
 
   step "Loading registry"
@@ -840,14 +884,22 @@ if [[ "${1:-}" == "update" ]]; then
     mkdir -p "$INSTALL_DIR"
     ok "Install dir: ${INSTALL_DIR}"
 
-    _do_install
+    if [[ "$DRY_RUN" == true ]]; then
+      info "DRY RUN: would update ${NAME} ${OLD_TAG} → ${NEW_TAG}"
+    else
+      _do_install
+    fi
 
     echo ""
     echo -e "   ${GREEN}✔${RESET} ${BOLD}${NAME}${RESET} updated  ${DIM}${OLD_TAG} → ${CYAN}${NEW_TAG}${RESET}"
   done
 
   echo ""
-  echo -e "${GREEN}${BOLD}✔ All updates applied.${RESET}"
+  if [[ "$DRY_RUN" == true ]]; then
+    echo -e "${YELLOW}${BOLD}Dry run complete — no updates were applied.${RESET}"
+  else
+    echo -e "${GREEN}${BOLD}✔ All updates applied.${RESET}"
+  fi
   echo ""
   exit 0
 fi
@@ -862,7 +914,7 @@ ROLLBACK_MODE=false
 HISTORY_MODE=false
 # YES_MODE and ARCH_FILTER already initialised above
 
-while getopts ":aRluHrA:y" opt; do
+while getopts ":aRluHrA:yn" opt; do
   case $opt in
     a) ARCHIVE_MODE=true ;;
     A) ARCH_FILTER="$OPTARG" ;;
@@ -872,6 +924,7 @@ while getopts ":aRluHrA:y" opt; do
     r) ROLLBACK_MODE=true ;;
     H) HISTORY_MODE=true ;;
     y) YES_MODE=true ;;
+    n) DRY_RUN=true ;;
     *) usage ;;
   esac
 done
@@ -939,8 +992,7 @@ if [[ "$HISTORY_MODE" == true ]]; then
   echo -e "\n${BOLD}rack — URL history for '${NAME}'${RESET}"
 
   step "Validating arguments"
-  [[ "$NAME" =~ ^[a-zA-Z0-9._-]+$ ]] \
-    || die "Invalid name '${NAME}'. Use only letters, numbers, dots, dashes, underscores."
+  validate_name "$NAME"
   ok "Name: ${NAME}"
 
   step "Reading history"
@@ -1001,8 +1053,7 @@ if [[ "$ROLLBACK_MODE" == true ]]; then
   echo -e "\n${BOLD}rack — rolling back '${NAME}'${RESET}"
 
   step "Validating arguments"
-  [[ "$NAME" =~ ^[a-zA-Z0-9._-]+$ ]] \
-    || die "Invalid name '${NAME}'. Use only letters, numbers, dots, dashes, underscores."
+  validate_name "$NAME"
   ok "Name: ${NAME}"
 
   [[ "$INDEX" =~ ^[0-9]+$ && "$INDEX" -gt 0 ]] \
@@ -1082,8 +1133,7 @@ if [[ "$UPDATE_MODE" == true ]]; then
   echo -e "\n${BOLD}rack — updating '${NAME}'${RESET}"
 
   step "Validating arguments"
-  [[ "$NAME" =~ ^[a-zA-Z0-9._-]+$ ]] \
-    || die "Invalid name '${NAME}'. Use only letters, numbers, dots, dashes, underscores."
+  validate_name "$NAME"
   ok "Name: ${NAME}"
 
   step "Checking registry"
@@ -1161,10 +1211,16 @@ if [[ "$REMOVE_MODE" == true ]]; then
 
   # ── validate name ───────────────────────────────────────────────────────
   step "Validating arguments"
-  [[ "$NAME" =~ ^[a-zA-Z0-9._-]+$ ]] \
-    || die "Invalid name '${NAME}'. Use only letters, numbers, dots, dashes, underscores."
+  validate_name "$NAME"
   ok "Name: ${NAME}"
   ok "Mode: remove (-R)"
+
+  if [[ "$DRY_RUN" == true ]]; then
+    info "DRY RUN: would remove ${NAME} (from registry + disk if present)"
+    ok "Dry run — no changes made"
+    echo ""
+    exit 0
+  fi
 
   # ── lookup in registry ──────────────────────────────────────────────────
   step "Checking registry"
@@ -1263,8 +1319,7 @@ URL="$2"
 # ── validation ────────────────────────────────────────────────────────────────
 step "Validating arguments"
 
-[[ "$NAME" =~ ^[a-zA-Z0-9._-]+$ ]] \
-  || die "Invalid name '${NAME}'. Use only letters, numbers, dots, dashes, underscores."
+validate_name "$NAME"
 ok "Name:  ${NAME}"
 
 if [[ "$URL" =~ ^https?:// ]]; then
