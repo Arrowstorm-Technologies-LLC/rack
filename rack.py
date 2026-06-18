@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -405,7 +406,94 @@ def validate_name(name):
     if name.startswith('-'):
         die(f"Invalid name '{name}'. Names may not start with '-' .")
 
-def cmd_install(args, archive_mode, dry_run=False):
+def package_for_path(path):
+    checks = (
+        ('pacman', ['-Qo', path], lambda out: out.split(' owned by ', 1)[-1].split()[0] if ' owned by ' in out else ''),
+        ('dpkg',   ['-S', path],   lambda out: out.split(':', 1)[0] if out else ''),
+        ('rpm',    ['-qf', path],  lambda out: out.strip()),
+        ('apk',    ['info', '-W', path], lambda out: out.splitlines()[0].strip() if out else ''),
+    )
+    for cmd, args, parse in checks:
+        if not shutil.which(cmd):
+            continue
+        try:
+            r = subprocess.run([cmd, *args], capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            pkg = parse(r.stdout.strip())
+            if pkg:
+                return pkg
+    return ''
+
+def detect_name_conflict(name):
+    existing = shutil.which(name)
+    if not existing:
+        return None, ''
+    target = str(INSTALL_DIR / name)
+    if existing == target:
+        return None, ''
+    install_prefix = str(INSTALL_DIR) + os.sep
+    if existing.startswith(install_prefix):
+        return None, ''
+    return existing, package_for_path(existing)
+
+def resolve_name_conflict(name, yes_mode=False, dry_run=False):
+    """Return the install name after handling conflicts with system commands."""
+    conflict_path, conflict_pkg = detect_name_conflict(name)
+    if not conflict_path:
+        return name
+
+    if dry_run:
+        warn(f"Name '{name}' conflicts with existing command: {conflict_path}")
+        if conflict_pkg:
+            info(f'Package: {conflict_pkg}')
+        info('Dry run — conflict resolution skipped')
+        return name
+
+    if yes_mode:
+        warn(f"Name '{name}' conflicts with {conflict_path} — auto-shadowing (-y)")
+        if conflict_pkg:
+            info(f'Package: {conflict_pkg}')
+        return name
+
+    if not sys.stdin.isatty():
+        die(f"Name '{name}' conflicts with existing command '{conflict_path}'. "
+            f'Run interactively to shadow it or choose a different name.')
+
+    step('Name conflict')
+    warn(f"'{name}' already exists on your system: {conflict_path}")
+    if conflict_pkg:
+        info(f'Provided by package: {conflict_pkg}')
+    print()
+    print(f"   {CYAN}1){RESET}  Shadow — install as '{name}' to {INSTALL_DIR}")
+    print(f"       {DIM}(takes precedence when {INSTALL_DIR} appears before system paths in PATH){RESET}")
+    print(f"   {CYAN}2){RESET}  Pick a different name")
+    print()
+
+    while True:
+        choice = input(f'   {BOLD}Choice [1/2]:{RESET} ').strip()
+        if choice == '1':
+            ok(f"Will shadow existing command as '{name}'")
+            path_dirs = os.environ.get('PATH', '').split(':')
+            if str(INSTALL_DIR) not in path_dirs:
+                warn(f"Shadowing requires '{INSTALL_DIR}' to be in your PATH.")
+            return name
+        if choice == '2':
+            while True:
+                new_name = input(f'   {BOLD}New name:{RESET} ').strip()
+                validate_name(new_name)
+                new_conflict, _ = detect_name_conflict(new_name)
+                if new_conflict:
+                    warn(f"'{new_name}' also conflicts with {new_conflict} — try another.")
+                elif (INSTALL_DIR / new_name).exists():
+                    warn(f"'{new_name}' already exists in {INSTALL_DIR} — try another.")
+                else:
+                    ok(f'Using name: {new_name}')
+                    return new_name
+        warn('Enter 1 or 2.')
+
+def cmd_install(args, archive_mode, dry_run=False, yes_mode=False):
     if len(args) < 2:
         usage(); sys.exit(1)
     name, url_or_slug = args[0], args[1]
@@ -430,6 +518,9 @@ def cmd_install(args, archive_mode, dry_run=False):
         print(f'      {DIM}export PATH="$HOME/.local/bin:$PATH"{RESET}')
     else:
         ok('Install dir is in PATH')
+
+    name = resolve_name_conflict(name, yes_mode=yes_mode, dry_run=dry_run)
+    ok(f'Install name: {name}')
 
     if (INSTALL_DIR / name).exists():
         entry = registry_lookup(name)
@@ -935,7 +1026,7 @@ def main():
     elif rollback_mode: cmd_rollback(rest, archive_mode, dry_run=dry_run)
     elif update_mode:   cmd_update_single(rest, archive_mode, dry_run=dry_run)
     elif remove_mode:   cmd_remove(rest, dry_run=dry_run)
-    else:               cmd_install(rest, archive_mode, dry_run=dry_run)
+    else:               cmd_install(rest, archive_mode, dry_run=dry_run, yes_mode=yes_mode)
 
 if __name__ == '__main__':
     main()

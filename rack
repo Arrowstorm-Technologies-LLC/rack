@@ -93,6 +93,110 @@ validate_name() {
   fi
 }
 
+# Populates CONFLICT_PATH (and optionally CONFLICT_PKG) when <name> resolves to an
+# existing command outside the rack install directory.
+_detect_name_conflict() {
+  local n="$1"
+  CONFLICT_PATH=""
+  CONFLICT_PKG=""
+
+  local existing=""
+  existing="$(command -v "$n" 2>/dev/null || true)"
+  [[ -z "$existing" ]] && return 1
+
+  local target="${INSTALL_DIR}/${n}"
+  [[ "$existing" == "$target" ]] && return 1
+  case "$existing" in
+    "${INSTALL_DIR}"/*) return 1 ;;
+  esac
+
+  CONFLICT_PATH="$existing"
+  CONFLICT_PKG="$(_package_for_path "$existing")"
+  return 0
+}
+
+_package_for_path() {
+  local p="$1" out=""
+  if command -v pacman &>/dev/null; then
+    out="$(pacman -Qo "$p" 2>/dev/null | sed -n 's/.* owned by \([^ ]*\).*/\1/p' | head -n1)"
+  elif command -v dpkg &>/dev/null; then
+    out="$(dpkg -S "$p" 2>/dev/null | cut -d: -f1 | head -n1)"
+  elif command -v rpm &>/dev/null; then
+    out="$(rpm -qf "$p" 2>/dev/null | head -n1)"
+  elif command -v apk &>/dev/null; then
+    out="$(apk info -W "$p" 2>/dev/null | head -n1)"
+  fi
+  printf '%s' "$out"
+}
+
+# When NAME conflicts with a system command, prompt to shadow it or pick a new name.
+# Mutates global NAME on success.
+resolve_name_conflict() {
+  if ! _detect_name_conflict "$NAME"; then
+    return 0
+  fi
+
+  if [[ "${DRY_RUN:-false}" == true ]]; then
+    warn "Name '${NAME}' conflicts with existing command: ${CONFLICT_PATH}"
+    [[ -n "$CONFLICT_PKG" ]] && info "Package: ${CONFLICT_PKG}"
+    info "Dry run — conflict resolution skipped"
+    return 0
+  fi
+
+  if [[ "${YES_MODE:-false}" == true ]]; then
+    warn "Name '${NAME}' conflicts with ${CONFLICT_PATH} — auto-shadowing (-y)"
+    [[ -n "$CONFLICT_PKG" ]] && info "Package: ${CONFLICT_PKG}"
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    die "Name '${NAME}' conflicts with existing command '${CONFLICT_PATH}'. Run interactively to shadow it or choose a different name."
+  fi
+
+  step "Name conflict"
+  warn "'${NAME}' already exists on your system: ${CONFLICT_PATH}"
+  [[ -n "$CONFLICT_PKG" ]] && info "Provided by package: ${CONFLICT_PKG}"
+  echo ""
+  echo -e "   ${CYAN}1)${RESET}  Shadow — install as '${NAME}' to ${INSTALL_DIR}"
+  echo -e "       ${DIM}(takes precedence when ${INSTALL_DIR} appears before system paths in PATH)${RESET}"
+  echo -e "   ${CYAN}2)${RESET}  Pick a different name"
+  echo ""
+
+  local choice new_name
+  while true; do
+    printf "   ${BOLD}Choice [1/2]:${RESET} "
+    read -r choice < /dev/tty
+    case "$choice" in
+      1)
+        ok "Will shadow existing command as '${NAME}'"
+        if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
+          warn "Shadowing requires '${INSTALL_DIR}' to be in your PATH."
+        fi
+        return 0
+        ;;
+      2)
+        while true; do
+          printf "   ${BOLD}New name:${RESET} "
+          read -r new_name < /dev/tty
+          validate_name "$new_name"
+          if _detect_name_conflict "$new_name"; then
+            warn "'${new_name}' also conflicts with ${CONFLICT_PATH} — try another."
+          elif [[ -f "${INSTALL_DIR}/${new_name}" ]]; then
+            warn "'${new_name}' already exists in ${INSTALL_DIR} — try another."
+          else
+            NAME="$new_name"
+            ok "Using name: ${NAME}"
+            return 0
+          fi
+        done
+        ;;
+      *)
+        warn "Enter 1 or 2."
+        ;;
+    esac
+  done
+}
+
 spinner_start() {
   SPINNER_MSG="$1"
   SPINNER_CHARS='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
@@ -1430,6 +1534,9 @@ if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
 else
   ok "Install dir is in PATH"
 fi
+
+resolve_name_conflict
+ok "Install name: ${NAME}"
 
 if [[ -f "${INSTALL_DIR}/${NAME}" ]]; then
   EXISTING_ENTRY="$(registry_lookup "$NAME")"
