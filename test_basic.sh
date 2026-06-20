@@ -55,7 +55,7 @@ echo "  OK"
 echo "[10/12] Python installer-first archive logic present..."
 grep -q 'find_installer_script' ./rack.py
 grep -q 'run_project_installer' ./rack.py
-grep -q 'SOURCE_ARCHIVE' ./rack.py
+grep -q 'source_archive' ./rack.py
 echo "  OK"
 
 echo "[11/12] Bash branch-archive fallback for release-less repos..."
