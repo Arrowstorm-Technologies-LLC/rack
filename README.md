@@ -71,28 +71,30 @@ rack update -n -y
 
 Tool names must start with an alphanumeric character and can only contain letters, numbers, dots, dashes, and underscores. The characters `.`, `..`, names starting with `-`, or containing `/` are rejected early with a clear error.
 
-### Source archive fallback and installer scripts
+### Source archive fallback and project installers
 
-Some tools don't ship pre-built binaries as release assets — they distribute a shell installer that handles the installation itself (nvm, oh-my-zsh, and similar tools). rack handles these automatically.
+Some tools don't ship pre-built binaries as release assets — they distribute an `install.sh` that deploys all binaries and installs distro-specific dependencies (e.g. [grabbit](https://github.com/Arrowstorm-Technologies-LLC/grabbit)). rack handles these automatically.
 
-When a release has no downloadable binary assets, rack falls back to the GitHub-generated source tarball for that release tag and searches it for a recognisable installer script (`install.sh`, `setup.sh`, `bootstrap.sh`, etc.). If found, rack prompts you to run it:
+When a release has no downloadable binary assets, rack falls back to the GitHub-generated source tarball for that release tag. When extracting any archive, rack **prefers `install.sh`** (or `setup.sh`, `bootstrap.sh`, etc.) over copying a single script:
 
 ```sh
-rack nvm https://github.com/nvm-sh/nvm
+rack grabbit Arrowstorm-Technologies-LLC/grabbit
 # → no release assets found, falls back to source archive
-# → finds install.sh, classifies it as installer
+# → finds install.sh before the grabbit script
 # → Run installer? [Y/n]
-# → runs bash install.sh from its own directory
+# → INSTALL_DIR=~/.local/bin bash install.sh
+# → deploys grabbit + grabbit-gui + grabbit_gui.py, installs Tk/Python deps
+# → registers grabbit in the rack registry
 ```
 
-When the source archive contains a plain script (shebang, but no installer behaviour) or an ELF binary, rack installs it to the install dir as usual.
+rack passes `INSTALL_DIR` and `RACK_DIR` to project installers so they deploy into the same directory rack uses. Installs that produce the requested binary name are **registered** in rack's registry and can be updated with `rack -u` or `rack update` (re-running `install.sh` from the new release).
+
+When no project installer is present, rack falls back to locating a binary or script named `<name>` in the archive.
 
 **Classification heuristics** (in priority order):
 1. **Filename** — `install.sh`, `setup.sh`, `bootstrap.sh`, `installer.sh`, `install`, `setup` → installer
 2. **Magic bytes** — ELF header (`7f 45 4c 46`) → binary
 3. **Content** — shebang present and file modifies shell profiles or installs into `$HOME` → installer; otherwise → script (installed to PATH)
-
-Because installer scripts control their own destination, installs run this way are **not registered** in rack's registry and cannot be updated or rolled back via rack.
 
 ### Updating
 
@@ -141,7 +143,7 @@ Downloads are performed with the best available tool (curl or wget for Bash; url
 
 - Arbitrary (non-GitHub) download URLs are supported but won't benefit from slug resolution, source archive fallback, or `rack update` checks.
 - Update checks require the source URL to contain a versioned release tag (e.g. `v1.2.3`). Binaries installed from tag-less URLs are skipped by `rack update`.
-- Installs performed by external installer scripts are not registered in rack's registry and cannot be updated or rolled back via rack.
+- Project installers that do not create the requested binary name in `RACK_DIR` are not registered in rack's registry.
 - The GitHub API is queried unauthenticated (60 requests/hour). Running `rack update` with many managed installs may hit this limit.
 
 ## Comparison to similar tools

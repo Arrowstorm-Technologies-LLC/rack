@@ -235,6 +235,7 @@ cleanup_temp() {
 # ── file classification ───────────────────────────────────────────────────────
 
 SOURCE_ARCHIVE=false
+INSTALLER_SCRIPT_NAMES=(install.sh setup.sh bootstrap.sh installer.sh install setup)
 
 _classify_file() {
   local file="$1" fname
@@ -250,8 +251,74 @@ _classify_file() {
   [[ "$magic" == "7f454c46" ]] && { printf 'binary'; return; }
   # Script: check shebang, then distinguish installer vs tool by content
   head -c2 "$file" 2>/dev/null | grep -q $'#!' || { printf 'binary'; return; }
-  grep -qiE '\.(bashrc|zshrc|profile|bash_profile)|export [A-Z_]+=.*HOME|mkdir -p .*HOME' \
+    grep -qiE '\.(bashrc|zshrc|profile|bash_profile)|export [A-Z_]+=.*HOME|mkdir -p .*HOME' \
     "$file" 2>/dev/null && printf 'installer' || printf 'script'
+}
+
+_find_installer_script() {
+  local extract_dir="$1" _iname _candidate
+  for _iname in "${INSTALLER_SCRIPT_NAMES[@]}"; do
+    _candidate="$(find "$extract_dir" -type f -name "$_iname" 2>/dev/null | head -n 1)"
+    if [[ -n "$_candidate" ]]; then
+      printf '%s' "$_candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_run_project_installer() {
+  local installer="$1"
+  local inst_name
+  inst_name="$(basename "$installer")"
+
+  step "Project installer detected"
+  info "${inst_name} deploys binaries and installs distro-specific dependencies"
+  info "Install dir: ${INSTALL_DIR}"
+
+  if [[ "${DRY_RUN:-false}" == true ]]; then
+    info "Would run: INSTALL_DIR=${INSTALL_DIR} RACK_DIR=${INSTALL_DIR} bash ${inst_name}"
+    ok "Dry run complete (no changes made)"
+    return 0
+  fi
+
+  if [[ -t 0 && "${YES_MODE:-false}" != true ]]; then
+    echo ""
+    echo -en "   ${BOLD}Run installer? [Y/n]${RESET} "
+    read -r _run_confirm < /dev/tty
+    [[ "$_run_confirm" =~ ^[Nn]$ ]] && { echo -e "\n   ${DIM}Aborted.${RESET}\n"; exit 0; }
+    echo ""
+  fi
+
+  chmod +x "$installer"
+  (
+    cd "$(dirname "$installer")"
+    INSTALL_DIR="$INSTALL_DIR" RACK_DIR="$INSTALL_DIR" bash "$inst_name"
+  )
+
+  echo ""
+  ok "Installer finished"
+
+  if [[ ! -f "${INSTALL_DIR}/${NAME}" ]]; then
+    warn "Installer completed but '${INSTALL_DIR}/${NAME}' was not created — skipping registry"
+    cleanup_temp
+    return 0
+  fi
+
+  chmod +x "${INSTALL_DIR}/${NAME}" 2>/dev/null || true
+
+  step "Updating registry"
+  local _cur_entry _cur_url
+  _cur_entry="$(registry_lookup "$NAME")"
+  _cur_url="$(printf '%s' "$_cur_entry" | cut -f2)"
+  spinner_start "Recording install"
+  [[ -z "$_cur_entry" || "$URL" != "$_cur_url" ]] && history_append "$NAME" "$URL"
+  registry_add "$NAME" "$URL" "${INSTALL_DIR}/${NAME}"
+  spinner_stop
+  ok "Registered: ${REGISTRY}"
+
+  cleanup_temp
+  return 0
 }
 
 # ── registry helpers ──────────────────────────────────────────────────────────
@@ -787,6 +854,20 @@ _do_install() {
     find "$extract_dir" -maxdepth 2 | sed "s|${extract_dir}||" | sed '/^$/d' \
       | while IFS= read -r line; do echo -e "      ${DIM}${line}${RESET}"; done
 
+    # Prefer project install.sh (deploys all binaries + distro deps) over single-file copy
+    local _installer=""
+    if _installer="$(_find_installer_script "$extract_dir")"; then
+      local _iclass
+      spinner_start "Classifying '$(basename "$_installer")'"
+      _iclass="$(_classify_file "$_installer")"
+      spinner_stop
+      ok "Found project installer: ${_installer#"$extract_dir"} (${_iclass})"
+      if [[ "$_iclass" == "installer" ]]; then
+        _run_project_installer "$_installer"
+        return 0
+      fi
+    fi
+
     step "Locating binary"
 
     local binary=""
@@ -849,22 +930,8 @@ _do_install() {
       ok "File type: ${_fclass}"
 
       if [[ "$_fclass" == "installer" ]]; then
-        step "Installer script detected"
-        info "$(basename "$binary") manages its own installation"
-        echo ""
-        if [[ -t 0 ]]; then
-          echo -en "   ${BOLD}Run installer? [Y/n]${RESET} "
-          read -r _run_confirm < /dev/tty
-          [[ "$_run_confirm" =~ ^[Nn]$ ]] && { echo -e "\n   ${DIM}Aborted.${RESET}\n"; exit 0; }
-        fi
-        echo ""
-        chmod +x "$binary"
-        ( cd "$(dirname "$binary")" && bash "$(basename "$binary")" )
-        echo ""
-        echo -e "${GREEN}${BOLD}✔ Installer finished.${RESET}"
-        echo -e "   ${DIM}Note: rack cannot track or update installs run by external installer scripts.${RESET}"
-        echo ""
-        exit 0
+        _run_project_installer "$binary"
+        return 0
       fi
     fi
 

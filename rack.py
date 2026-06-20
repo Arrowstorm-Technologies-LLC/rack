@@ -31,6 +31,10 @@ HISTORY     = Path(os.environ.get('RACK_HISTORY',  '~/.local/share/rack/history.
 GH_HEADERS   = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
 ARCHIVE_EXTS = ('.tar.gz', '.tgz', '.tar.bz2', '.tar.xz', '.zip')
 NAME_RE      = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$')
+INSTALLER_SCRIPT_NAMES = (
+    'install.sh', 'setup.sh', 'bootstrap.sh', 'installer.sh', 'install', 'setup',
+)
+SOURCE_ARCHIVE = False
 
 # ── colors ────────────────────────────────────────────────────────────────────
 if sys.stdout.isatty():
@@ -174,9 +178,15 @@ def is_archive(url):
 
 def select_asset(release, slug, archive_mode):
     """Present asset picker for a release. Returns (url, archive_mode)."""
+    global SOURCE_ARCHIVE
     assets = release.get('assets', [])
     if not assets:
-        die(f"Release '{release['tag_name']}' for '{slug}' has no downloadable assets.")
+        tag = release['tag_name']
+        src_url = f'https://github.com/{slug}/archive/refs/tags/{tag}.tar.gz'
+        warn('No release assets found — falling back to source archive')
+        info(f'Source: {src_url}')
+        SOURCE_ARCHIVE = True
+        return src_url, True
 
     if len(assets) == 1:
         url = assets[0]['browser_download_url']
@@ -242,6 +252,8 @@ def search_and_pick(query, archive_mode):
 
 def resolve_slug(input_str, archive_mode):
     """Entry point: resolve a URL, owner/repo slug, or bare name to (url, archive_mode)."""
+    global SOURCE_ARCHIVE
+    SOURCE_ARCHIVE = False
     if re.match(r'^https?://', input_str):
         return input_str, archive_mode or is_archive(input_str)
 
@@ -342,8 +354,78 @@ def find_binary(extract_dir, name):
             return p
     return None
 
+def classify_file(path: Path) -> str:
+    if path.name in INSTALLER_SCRIPT_NAMES:
+        return 'installer'
+    data = path.read_bytes()[:4]
+    if data == b'\x7fELF':
+        return 'binary'
+    try:
+        head = path.read_text(errors='ignore')[:4096]
+    except OSError:
+        return 'binary'
+    if not head.startswith('#!'):
+        return 'binary'
+    installer_markers = (
+        '.bashrc', '.zshrc', '.profile', '.bash_profile',
+        'export ', 'mkdir -p', 'HOME',
+    )
+    if any(marker in head for marker in installer_markers):
+        return 'installer'
+    return 'script'
+
+def find_installer_script(extract_dir: Path):
+    for iname in INSTALLER_SCRIPT_NAMES:
+        for p in extract_dir.rglob(iname):
+            if p.is_file():
+                return p
+    return None
+
+def run_project_installer(installer: Path, name: str, url: str, dry_run=False, yes_mode=False):
+    step('Project installer detected')
+    info(f'{installer.name} deploys binaries and installs distro-specific dependencies')
+    info(f'Install dir: {INSTALL_DIR}')
+
+    if dry_run:
+        info(f'Would run: INSTALL_DIR={INSTALL_DIR} RACK_DIR={INSTALL_DIR} bash {installer.name}')
+        ok('Dry run complete (no changes made)')
+        return
+
+    if sys.stdin.isatty() and not yes_mode:
+        print(f'   {BOLD}Run installer? [Y/n]{RESET} ', end='', flush=True)
+        try:
+            confirm = sys.stdin.readline().strip()
+        except EOFError:
+            confirm = ''
+        if confirm.lower() == 'n':
+            print(f'\n   {DIM}Aborted.{RESET}\n')
+            sys.exit(0)
+        print()
+
+    installer.chmod(installer.stat().st_mode | stat.S_IXUSR)
+    env = os.environ.copy()
+    env['INSTALL_DIR'] = str(INSTALL_DIR)
+    env['RACK_DIR'] = str(INSTALL_DIR)
+    subprocess.run(['bash', installer.name], cwd=installer.parent, env=env, check=True)
+
+    ok('Installer finished')
+    dest = INSTALL_DIR / name
+    if not dest.exists():
+        warn(f"Installer completed but '{dest}' was not created — skipping registry")
+        return
+
+    dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    step('Updating registry')
+    with Spinner('Recording install'):
+        entry = registry_lookup(name)
+        if not entry or entry[1] != url:
+            history_append(name, url)
+        registry_add(name, url, dest)
+    ok(f'Registered: {REGISTRY}')
+
 # ── install core ──────────────────────────────────────────────────────────────
-def do_install(name, url, archive_mode, dry_run=False):
+def do_install(name, url, archive_mode, dry_run=False, yes_mode=False):
     archive_name = url.split('/')[-1].split('?')[0]
 
     if dry_run:
@@ -365,12 +447,29 @@ def do_install(name, url, archive_mode, dry_run=False):
             extract_dir.mkdir()
             extract_archive(tmpfile, extract_dir)
 
+            installer = find_installer_script(extract_dir)
+            if installer:
+                with Spinner(f"Classifying '{installer.name}'"):
+                    iclass = classify_file(installer)
+                ok(f'Found project installer: {installer.relative_to(extract_dir)} ({iclass})')
+                if iclass == 'installer':
+                    run_project_installer(installer, name, url, dry_run=dry_run, yes_mode=yes_mode)
+                    return
+
             step('Locating binary')
             with Spinner(f"Searching for '{name}'"):
                 binary = find_binary(extract_dir, name)
 
             if binary and binary.name == name:
                 ok(f'Found exact match: {binary.relative_to(extract_dir)}')
+            elif binary and SOURCE_ARCHIVE:
+                with Spinner(f"Classifying '{binary.name}'"):
+                    fclass = classify_file(binary)
+                ok(f'File type: {fclass}')
+                if fclass == 'installer':
+                    run_project_installer(binary, name, url, dry_run=dry_run, yes_mode=yes_mode)
+                    return
+                warn(f"No file named '{name}' found — using: {binary.name}")
             elif binary:
                 warn(f"No file named '{name}' found — using: {binary.name} → installed as '{name}'")
             else:
@@ -530,7 +629,7 @@ def cmd_install(args, archive_mode, dry_run=False, yes_mode=False):
         else:
             warn(f"'{name}' already exists at {INSTALL_DIR / name} — it will be overwritten.")
 
-    do_install(name, url, archive_mode, dry_run)
+    do_install(name, url, archive_mode, dry_run, yes_mode=yes_mode)
 
     if not dry_run:
         print(f'\n{GREEN}{BOLD}✔ Done!{RESET}')
@@ -708,7 +807,7 @@ def cmd_history(args):
         print(f'   Roll back with: {BOLD}rack.py -r {name} <index>{RESET}')
     print()
 
-def cmd_rollback(args, archive_mode, dry_run=False):
+def cmd_rollback(args, archive_mode, dry_run=False, yes_mode=False):
     if len(args) < 2:
         die('Rollback mode requires a name and index. Usage: rack.py -r <name> <index>')
     name, index_str = args[0], args[1]
@@ -757,7 +856,7 @@ def cmd_rollback(args, archive_mode, dry_run=False):
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     ok(f'Install dir: {INSTALL_DIR}')
 
-    do_install(name, target_url, archive_mode, dry_run)
+    do_install(name, target_url, archive_mode, dry_run, yes_mode=yes_mode)
 
     if not dry_run:
         print(f'\n{GREEN}{BOLD}✔ Done!{RESET}')
@@ -766,7 +865,7 @@ def cmd_rollback(args, archive_mode, dry_run=False):
     else:
         print(f'\n{YELLOW}{BOLD}Dry run complete — no changes made.{RESET}\n')
 
-def cmd_update_single(args, archive_mode, dry_run=False):
+def cmd_update_single(args, archive_mode, dry_run=False, yes_mode=False):
     if not args:
         die('Update mode requires a name. Usage: rack.py -u <name> [new-url]')
     name = args[0]
@@ -807,7 +906,7 @@ def cmd_update_single(args, archive_mode, dry_run=False):
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     ok(f'Install dir: {INSTALL_DIR}')
 
-    do_install(name, url, archive_mode, dry_run)
+    do_install(name, url, archive_mode, dry_run, yes_mode=yes_mode)
 
     if not dry_run:
         print(f'\n{GREEN}{BOLD}✔ Done!{RESET}')
@@ -943,7 +1042,7 @@ def cmd_global_update(yes_mode=False, dry_run=False):
         INSTALL_DIR.mkdir(parents=True, exist_ok=True)
         ok(f'Install dir: {INSTALL_DIR}')
 
-        do_install(name, url, archive_mode, dry_run=False)  # apply only if we reached here
+        do_install(name, url, archive_mode, dry_run=False, yes_mode=yes_mode)
 
         print(f'\n   {GREEN}✔{RESET} {BOLD}{name}{RESET} updated  {DIM}{old_tag} → {CYAN}{new_tag}{RESET}')
 
@@ -1023,8 +1122,8 @@ def main():
 
     if   list_mode:     cmd_list()
     elif history_mode:  cmd_history(rest)
-    elif rollback_mode: cmd_rollback(rest, archive_mode, dry_run=dry_run)
-    elif update_mode:   cmd_update_single(rest, archive_mode, dry_run=dry_run)
+    elif rollback_mode: cmd_rollback(rest, archive_mode, dry_run=dry_run, yes_mode=yes_mode)
+    elif update_mode:   cmd_update_single(rest, archive_mode, dry_run=dry_run, yes_mode=yes_mode)
     elif remove_mode:   cmd_remove(rest, dry_run=dry_run)
     else:               cmd_install(rest, archive_mode, dry_run=dry_run, yes_mode=yes_mode)
 
