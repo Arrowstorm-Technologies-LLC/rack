@@ -432,6 +432,39 @@ _gh_repo_names() {
   grep -o '"full_name": *"[^"]*"' "$1" | grep -o '"[^"]*"$' | tr -d '"'
 }
 
+_gh_repo_default_branch() {
+  local slug="$1" json_file branch=""
+  json_file="$(mktemp)"
+  if _gh_api_get "https://api.github.com/repos/${slug}" "$json_file"; then
+    branch="$(grep -o '"default_branch": *"[^"]*"' "$json_file" | head -n1 | grep -o '"[^"]*"$' | tr -d '"')"
+  fi
+  rm -f "$json_file"
+  printf '%s' "${branch:-main}"
+}
+
+_gh_repo_exists() {
+  local slug="$1" json_file
+  json_file="$(mktemp)"
+  if _gh_api_get "https://api.github.com/repos/${slug}" "$json_file" \
+      && grep -q '"full_name"' "$json_file" 2>/dev/null; then
+    rm -f "$json_file"
+    return 0
+  fi
+  rm -f "$json_file"
+  return 1
+}
+
+_gh_fallback_branch_archive() {
+  local slug="$1" branch _src_url
+  branch="$(_gh_repo_default_branch "$slug")"
+  _src_url="https://github.com/${slug}/archive/refs/heads/${branch}.tar.gz"
+  warn "No releases found for '${slug}' — falling back to source archive (branch: ${branch})"
+  info "Source: ${_src_url}"
+  URL="$_src_url"
+  ARCHIVE_MODE=true
+  SOURCE_ARCHIVE=true
+}
+
 PICK_RESULT=""
 _pick_numbered() {
   local prompt="$1"; shift
@@ -464,6 +497,10 @@ _gh_resolve_release() {
 
   if [[ $rc -ne 0 ]] || ! grep -q '"tag_name"' "$json_file" 2>/dev/null; then
     rm -f "$json_file"
+    if _gh_repo_exists "$slug"; then
+      _gh_fallback_branch_archive "$slug"
+      return
+    fi
     if [[ "$allow_search" == true ]]; then
       local bare="${slug##*/}"
       warn "No release found for '${slug}' — searching GitHub..."
@@ -589,9 +626,17 @@ github_resolve_slug() {
   fi
 }
 
-# Extract owner/repo from a GitHub release download URL
+# Extract owner/repo from a GitHub release or archive URL
 _gh_slug_from_url() {
-  [[ "$1" =~ github\.com/([^/]+/[^/]+)/releases/ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+  if [[ "$1" =~ github\.com/([^/]+/[^/]+)/releases/ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$1" =~ github\.com/([^/]+/[^/]+)/archive/ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
 }
 
 # Extract the release tag from a GitHub release download URL

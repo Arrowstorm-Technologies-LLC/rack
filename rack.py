@@ -144,12 +144,28 @@ def gh_latest_release(slug):
     data = gh_get(f'/repos/{slug}/releases/latest')
     return data if (data and 'tag_name' in data) else None
 
+def gh_repo(slug):
+    data = gh_get(f'/repos/{slug}')
+    return data if (data and 'full_name' in data) else None
+
+def fallback_branch_archive(slug):
+    global SOURCE_ARCHIVE
+    repo = gh_repo(slug)
+    if not repo:
+        return None
+    branch = repo.get('default_branch') or 'main'
+    src_url = f'https://github.com/{slug}/archive/refs/heads/{branch}.tar.gz'
+    warn(f"No releases found for '{slug}' — falling back to source archive (branch: {branch})")
+    info(f'Source: {src_url}')
+    SOURCE_ARCHIVE = True
+    return src_url, True
+
 def gh_search(query):
     data = gh_get(f'/search/repositories?q={quote_plus(query)}&per_page=10&sort=stars&order=desc')
     return data.get('items', []) if data else []
 
 def slug_from_url(url):
-    m = re.search(r'github\.com/([^/]+/[^/]+)/releases/', url)
+    m = re.search(r'github\.com/([^/]+/[^/]+)/(?:releases|archive)/', url)
     return m.group(1) if m else None
 
 def tag_from_url(url):
@@ -209,6 +225,9 @@ def resolve_release(slug, allow_search, archive_mode):
         release = gh_latest_release(slug)
 
     if not release:
+        fb = fallback_branch_archive(slug)
+        if fb:
+            return fb
         if allow_search:
             warn(f"No release found for '{slug}' — searching GitHub...")
             print()

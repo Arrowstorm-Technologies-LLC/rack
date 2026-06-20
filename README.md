@@ -75,7 +75,7 @@ Tool names must start with an alphanumeric character and can only contain letter
 
 Some tools don't ship pre-built binaries as release assets — they distribute an `install.sh` that deploys all binaries and installs distro-specific dependencies (e.g. [grabbit](https://github.com/Arrowstorm-Technologies-LLC/grabbit)). rack handles these automatically.
 
-When a release has no downloadable binary assets, rack falls back to the GitHub-generated source tarball for that release tag. When extracting any archive, rack **prefers `install.sh`** (or `setup.sh`, `bootstrap.sh`, etc.) over copying a single script:
+When a repo has no GitHub releases (common for script-only tools), rack falls back to the default branch source archive (`refs/heads/main`). When a release exists but has no binary assets, rack uses the release tag archive instead. When extracting any archive, rack **prefers `install.sh`** (or `setup.sh`, `bootstrap.sh`, etc.) over copying a single script:
 
 ```sh
 rack grabbit Arrowstorm-Technologies-LLC/grabbit

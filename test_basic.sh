@@ -52,10 +52,20 @@ grep -q '_run_project_installer' ./rack
 grep -q 'RACK_DIR=' ./rack
 echo "  OK"
 
-echo "[10/10] Python installer-first archive logic present..."
+echo "[10/12] Python installer-first archive logic present..."
 grep -q 'find_installer_script' ./rack.py
 grep -q 'run_project_installer' ./rack.py
 grep -q 'SOURCE_ARCHIVE' ./rack.py
+echo "  OK"
+
+echo "[11/12] Bash branch-archive fallback for release-less repos..."
+grep -q '_gh_fallback_branch_archive' ./rack
+grep -q '_gh_repo_exists' ./rack
+echo "  OK"
+
+echo "[12/12] Python branch-archive fallback for release-less repos..."
+grep -q 'fallback_branch_archive' ./rack.py
+grep -q 'gh_repo' ./rack.py
 echo "  OK"
 
 echo ""
