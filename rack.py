@@ -30,11 +30,12 @@ HISTORY     = Path(os.environ.get('RACK_HISTORY',  '~/.local/share/rack/history.
 
 GH_HEADERS   = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
 ARCHIVE_EXTS = ('.tar.gz', '.tgz', '.tar.bz2', '.tar.xz', '.zip')
+TAR_MODES    = {'.tar.gz': 'r:gz', '.tgz': 'r:gz', '.tar.bz2': 'r:bz2', '.tar.xz': 'r:xz'}
 NAME_RE      = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$')
+PROG_NAME    = Path(sys.argv[0]).name
 INSTALLER_SCRIPT_NAMES = (
     'install.sh', 'setup.sh', 'bootstrap.sh', 'installer.sh', 'install', 'setup',
 )
-SOURCE_ARCHIVE = False
 
 # ── colors ────────────────────────────────────────────────────────────────────
 if sys.stdout.isatty():
@@ -149,7 +150,6 @@ def gh_repo(slug):
     return data if (data and 'full_name' in data) else None
 
 def fallback_branch_archive(slug):
-    global SOURCE_ARCHIVE
     repo = gh_repo(slug)
     if not repo:
         return None
@@ -157,8 +157,7 @@ def fallback_branch_archive(slug):
     src_url = f'https://github.com/{slug}/archive/refs/heads/{branch}.tar.gz'
     warn(f"No releases found for '{slug}' — falling back to source archive (branch: {branch})")
     info(f'Source: {src_url}')
-    SOURCE_ARCHIVE = True
-    return src_url, True
+    return src_url, True, True
 
 def gh_search(query):
     data = gh_get(f'/search/repositories?q={quote_plus(query)}&per_page=10&sort=stars&order=desc')
@@ -193,16 +192,14 @@ def is_archive(url):
     return any(url.endswith(ext) for ext in ARCHIVE_EXTS)
 
 def select_asset(release, slug, archive_mode):
-    """Present asset picker for a release. Returns (url, archive_mode)."""
-    global SOURCE_ARCHIVE
+    """Present asset picker for a release. Returns (url, archive_mode, source_archive)."""
     assets = release.get('assets', [])
     if not assets:
         tag = release['tag_name']
         src_url = f'https://github.com/{slug}/archive/refs/tags/{tag}.tar.gz'
         warn('No release assets found — falling back to source archive')
         info(f'Source: {src_url}')
-        SOURCE_ARCHIVE = True
-        return src_url, True
+        return src_url, True, True
 
     if len(assets) == 1:
         url = assets[0]['browser_download_url']
@@ -217,10 +214,11 @@ def select_asset(release, slug, archive_mode):
         url    = next(a['browser_download_url'] for a in assets if a['name'] == chosen)
         ok(f'Selected: {chosen}')
 
-    return url, archive_mode or is_archive(url)
+    return url, archive_mode or is_archive(url), False
 
 def resolve_release(slug, allow_search, archive_mode):
-    """Fetch latest release for owner/repo. Falls back to search on failure."""
+    """Fetch latest release for owner/repo. Falls back to search on failure.
+    Returns (url, archive_mode, source_archive)."""
     with Spinner(f"Fetching latest release for '{slug}'"):
         release = gh_latest_release(slug)
 
@@ -238,7 +236,8 @@ def resolve_release(slug, allow_search, archive_mode):
     return select_asset(release, slug, archive_mode)
 
 def search_and_pick(query, archive_mode):
-    """Search GitHub, let user pick a repo, then resolve its latest release."""
+    """Search GitHub, let user pick a repo, then resolve its latest release.
+    Returns (url, archive_mode, source_archive)."""
     step('Searching GitHub')
     info(f'Query: {query}')
 
@@ -270,11 +269,9 @@ def search_and_pick(query, archive_mode):
     return resolve_release(selected, False, archive_mode)
 
 def resolve_slug(input_str, archive_mode):
-    """Entry point: resolve a URL, owner/repo slug, or bare name to (url, archive_mode)."""
-    global SOURCE_ARCHIVE
-    SOURCE_ARCHIVE = False
+    """Entry point: resolve a URL, owner/repo slug, or bare name to (url, archive_mode, source_archive)."""
     if re.match(r'^https?://', input_str):
-        return input_str, archive_mode or is_archive(input_str)
+        return input_str, archive_mode or is_archive(input_str), False
 
     step('Resolving GitHub reference')
     info(f'Input: {input_str}')
@@ -325,27 +322,14 @@ def extract_archive(archive_path, extract_dir):
     name = archive_path.name
 
     with Spinner('Extracting'):
-        if name.endswith(('.tar.gz', '.tgz')):
-            with tarfile.open(archive_path, 'r:gz') as tf:
+        tar_mode = next((mode for ext, mode in TAR_MODES.items() if name.endswith(ext)), None)
+        if tar_mode:
+            with tarfile.open(archive_path, tar_mode) as tf:
                 try:
                     tf.extractall(extract_dir, filter='data')
                 except TypeError:
                     tf.extractall(extract_dir)
-            fmt = 'tar.gz'
-        elif name.endswith('.tar.bz2'):
-            with tarfile.open(archive_path, 'r:bz2') as tf:
-                try:
-                    tf.extractall(extract_dir, filter='data')
-                except TypeError:
-                    tf.extractall(extract_dir)
-            fmt = 'tar.bz2'
-        elif name.endswith('.tar.xz'):
-            with tarfile.open(archive_path, 'r:xz') as tf:
-                try:
-                    tf.extractall(extract_dir, filter='data')
-                except TypeError:
-                    tf.extractall(extract_dir)
-            fmt = 'tar.xz'
+            fmt = tar_mode[2:]  # strip 'r:' → gz / bz2 / xz
         elif name.endswith('.zip'):
             with zipfile.ZipFile(archive_path) as zf:
                 zf.extractall(extract_dir)
@@ -444,7 +428,7 @@ def run_project_installer(installer: Path, name: str, url: str, dry_run=False, y
     ok(f'Registered: {REGISTRY}')
 
 # ── install core ──────────────────────────────────────────────────────────────
-def do_install(name, url, archive_mode, dry_run=False, yes_mode=False):
+def do_install(name, url, archive_mode, dry_run=False, yes_mode=False, source_archive=False):
     archive_name = url.split('/')[-1].split('?')[0]
 
     if dry_run:
@@ -481,7 +465,7 @@ def do_install(name, url, archive_mode, dry_run=False, yes_mode=False):
 
             if binary and binary.name == name:
                 ok(f'Found exact match: {binary.relative_to(extract_dir)}')
-            elif binary and SOURCE_ARCHIVE:
+            elif binary and source_archive:
                 with Spinner(f"Classifying '{binary.name}'"):
                     fclass = classify_file(binary)
                 ok(f'File type: {fclass}')
@@ -621,7 +605,7 @@ def cmd_install(args, archive_mode, dry_run=False, yes_mode=False):
     validate_name(name)
     ok(f'Name:  {name}')
 
-    url, archive_mode = resolve_slug(url_or_slug, archive_mode)
+    url, archive_mode, source_archive = resolve_slug(url_or_slug, archive_mode)
     ok(f'URL:   {url}')
     ok(f"Mode:  {'archive extraction' if archive_mode else 'direct binary install'}")
 
@@ -648,19 +632,19 @@ def cmd_install(args, archive_mode, dry_run=False, yes_mode=False):
         else:
             warn(f"'{name}' already exists at {INSTALL_DIR / name} — it will be overwritten.")
 
-    do_install(name, url, archive_mode, dry_run, yes_mode=yes_mode)
+    do_install(name, url, archive_mode, dry_run, yes_mode=yes_mode, source_archive=source_archive)
 
     if not dry_run:
         print(f'\n{GREEN}{BOLD}✔ Done!{RESET}')
         print(f'   Installed {BOLD}{name}{RESET} → {INSTALL_DIR / name}')
-        print(f'   Remove later with: {BOLD}rack.py -R {name}{RESET}')
+        print(f'   Remove later with: {BOLD}{PROG_NAME} -R {name}{RESET}')
         print(f'   Run it with: {BOLD}{name}{RESET}\n')
     else:
         print(f'\n{YELLOW}{BOLD}Dry run complete — no changes made.{RESET}\n')
 
 def cmd_remove(args, dry_run=False):
     if not args:
-        die('Remove mode requires a name. Usage: rack.py -R <name>')
+        die(f'Remove mode requires a name. Usage: {PROG_NAME} -R <name>')
     name = args[0]
 
     print(f'\n{BOLD}rack — removing \'{name}\'{RESET}')
@@ -741,7 +725,7 @@ def cmd_remove(args, dry_run=False):
     print(f'\n{GREEN}{BOLD}✔ Done!{RESET}')
     print(f'   {BOLD}{name}{RESET} has been removed.')
     print(f'   It was originally installed from: {DIM}{source_url}{RESET}')
-    print(f'   Reinstall with: {BOLD}rack.py {name} <url>{RESET}\n')
+    print(f'   Reinstall with: {BOLD}{PROG_NAME} {name} <url>{RESET}\n')
 
 def cmd_list():
     print(f'\n{BOLD}rack — managed installs{RESET}')
@@ -782,14 +766,14 @@ def cmd_list():
     print()
     if missing:
         print(f'{YELLOW}{BOLD}⚠ {missing} install(s) missing from disk.{RESET}')
-        print(f'   Run {BOLD}rack.py -R <name>{RESET} to clean up stale registry entries.')
+        print(f'   Run {BOLD}{PROG_NAME} -R <name>{RESET} to clean up stale registry entries.')
     else:
         print(f'{GREEN}{BOLD}✔ All installs verified on disk.{RESET}')
     print()
 
 def cmd_history(args):
     if not args:
-        die('History mode requires a name. Usage: rack.py -H <name>')
+        die(f'History mode requires a name. Usage: {PROG_NAME} -H <name>')
     name = args[0]
 
     print(f'\n{BOLD}rack — URL history for \'{name}\'{RESET}')
@@ -823,12 +807,12 @@ def cmd_history(args):
 
     print()
     if len(entries) > 1:
-        print(f'   Roll back with: {BOLD}rack.py -r {name} <index>{RESET}')
+        print(f'   Roll back with: {BOLD}{PROG_NAME} -r {name} <index>{RESET}')
     print()
 
 def cmd_rollback(args, archive_mode, dry_run=False, yes_mode=False):
     if len(args) < 2:
-        die('Rollback mode requires a name and index. Usage: rack.py -r <name> <index>')
+        die(f'Rollback mode requires a name and index. Usage: {PROG_NAME} -r <name> <index>')
     name, index_str = args[0], args[1]
 
     print(f'\n{BOLD}rack — rolling back \'{name}\'{RESET}')
@@ -840,7 +824,7 @@ def cmd_rollback(args, archive_mode, dry_run=False, yes_mode=False):
         index = int(index_str)
         assert index > 0
     except (ValueError, AssertionError):
-        die(f'Index must be a positive integer. Usage: rack.py -r {name} <index>')
+        die(f'Index must be a positive integer. Usage: {PROG_NAME} -r {name} <index>')
     ok(f'Index: {index}')
 
     step('Reading history')
@@ -853,7 +837,7 @@ def cmd_rollback(args, archive_mode, dry_run=False, yes_mode=False):
     ok(f'Found {len(entries)} URL(s) in history')
 
     if index > len(entries):
-        die(f'Index {index} out of range — history has {len(entries)} entry(s). Run: rack.py -H {name}')
+        die(f'Index {index} out of range — history has {len(entries)} entry(s). Run: {PROG_NAME} -H {name}')
 
     _, target_url, target_ts = entries[index - 1]
     ok(f'Target URL (index {index}): {target_url}')
@@ -875,7 +859,7 @@ def cmd_rollback(args, archive_mode, dry_run=False, yes_mode=False):
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     ok(f'Install dir: {INSTALL_DIR}')
 
-    do_install(name, target_url, archive_mode, dry_run, yes_mode=yes_mode)
+    do_install(name, target_url, archive_mode, dry_run, yes_mode=yes_mode, source_archive=False)
 
     if not dry_run:
         print(f'\n{GREEN}{BOLD}✔ Done!{RESET}')
@@ -886,7 +870,7 @@ def cmd_rollback(args, archive_mode, dry_run=False, yes_mode=False):
 
 def cmd_update_single(args, archive_mode, dry_run=False, yes_mode=False):
     if not args:
-        die('Update mode requires a name. Usage: rack.py -u <name> [new-url]')
+        die(f'Update mode requires a name. Usage: {PROG_NAME} -u <name> [new-url]')
     name = args[0]
     alt  = args[1] if len(args) > 1 else None
 
@@ -901,7 +885,7 @@ def cmd_update_single(args, archive_mode, dry_run=False, yes_mode=False):
         entry = registry_lookup(name)
 
     if not entry:
-        die(f"'{name}' is not managed by rack. Install it first with: rack.py {name} <url>")
+        die(f"'{name}' is not managed by rack. Install it first with: {PROG_NAME} {name} <url>")
 
     stored_url   = entry[1]
     installed_at = entry[3]
@@ -910,13 +894,14 @@ def cmd_update_single(args, archive_mode, dry_run=False, yes_mode=False):
     info(f'Recorded URL: {stored_url}')
 
     if alt:
-        url, archive_mode = resolve_slug(alt, archive_mode)
+        url, archive_mode, source_archive = resolve_slug(alt, archive_mode)
         warn('Using alternative URL (registry will be updated)')
         info(f'Old: {stored_url}')
         info(f'New: {url}')
     else:
-        url          = stored_url
-        archive_mode = archive_mode or is_archive(url)
+        url            = stored_url
+        archive_mode   = archive_mode or is_archive(url)
+        source_archive = False
         ok('Using recorded URL')
 
     ok(f"Mode: {'archive extraction' if archive_mode else 'direct binary'}")
@@ -925,7 +910,7 @@ def cmd_update_single(args, archive_mode, dry_run=False, yes_mode=False):
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     ok(f'Install dir: {INSTALL_DIR}')
 
-    do_install(name, url, archive_mode, dry_run, yes_mode=yes_mode)
+    do_install(name, url, archive_mode, dry_run, yes_mode=yes_mode, source_archive=source_archive)
 
     if not dry_run:
         print(f'\n{GREEN}{BOLD}✔ Done!{RESET}')
@@ -1069,25 +1054,26 @@ def cmd_global_update(yes_mode=False, dry_run=False):
 
 # ── usage ─────────────────────────────────────────────────────────────────────
 def usage():
-    print(f"""{BOLD}rack.py{RESET} — install and remove GitHub binaries by name
+    p = PROG_NAME
+    print(f"""{BOLD}{p}{RESET} — install and remove GitHub binaries by name
 
 {BOLD}Usage:{RESET}
-  rack.py {CYAN}[-a] <name> <url|slug>{RESET}  Download and install a binary
-  rack.py {CYAN}-u <name> [url|slug]{RESET}    Update a managed binary (optionally from new URL or slug)
-  rack.py {CYAN}-r <name> <index>{RESET}       Roll back to a previously recorded URL
-  rack.py {CYAN}-H <name>{RESET}              Show URL history for a managed binary
-  rack.py {CYAN}-R <name>{RESET}              Remove a managed install
-  rack.py {CYAN}-l{RESET}                     List all managed installs
-  rack.py {CYAN}update [-y] [-n]{RESET}       Check for and apply updates for all managed installs
+  {p} {CYAN}[-a] <name> <url|slug>{RESET}  Download and install a binary
+  {p} {CYAN}-u <name> [url|slug]{RESET}    Update a managed binary (optionally from new URL or slug)
+  {p} {CYAN}-r <name> <index>{RESET}       Roll back to a previously recorded URL
+  {p} {CYAN}-H <name>{RESET}              Show URL history for a managed binary
+  {p} {CYAN}-R <name>{RESET}              Remove a managed install
+  {p} {CYAN}-l{RESET}                     List all managed installs
+  {p} {CYAN}update [-y] [-n]{RESET}       Check for and apply updates for all managed installs
 
 {BOLD}Flags:{RESET}
   {CYAN}-a{RESET}   Extract archive and find binary named <name> inside
   {CYAN}-u{RESET}   Update binary from its recorded source URL (or a new one)
-  {CYAN}-r{RESET}   Roll back to a URL from history by index (see rack.py -H <name>)
+  {CYAN}-r{RESET}   Roll back to a URL from history by index (see {p} -H <name>)
   {CYAN}-H{RESET}   Show numbered URL history for a binary
   {CYAN}-R{RESET}   Remove the named binary from the install dir
   {CYAN}-l{RESET}   List everything managed by rack
-  {CYAN}-y{RESET}   Auto-confirm prompts (for rack.py update)
+  {CYAN}-y{RESET}   Auto-confirm prompts (for {p} update)
   {CYAN}-n{RESET}   Dry-run: resolve and show plan but do not download or modify anything
 
   Supported archives: .tar.gz  .tgz  .tar.bz2  .tar.xz  .zip
