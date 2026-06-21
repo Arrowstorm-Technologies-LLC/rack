@@ -819,7 +819,12 @@ _do_install() {
   info "Saving to temp: ${tmpfile}"
   echo ""
 
-  if command -v wget &>/dev/null; then
+  if [[ "$URL" =~ ^file:// ]]; then
+    local _local_path="${URL#file://}"
+    info "Using cp (local file)"
+    echo ""
+    cp "$_local_path" "$tmpfile" || die "Copy failed for ${URL}"
+  elif command -v wget &>/dev/null; then
     info "Using wget"
     echo ""
     wget --show-progress -q -O "$tmpfile" "$URL" || die "Download failed (wget) for ${URL}"
@@ -1452,6 +1457,12 @@ if [[ "$UPDATE_MODE" == true ]]; then
           case "$_fname" in *.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.zip) ARCHIVE_MODE=true ;; esac
         fi
       fi
+    elif [[ "$ALT_URL" =~ ^file:// ]]; then
+      URL="$ALT_URL"
+      if [[ "$ARCHIVE_MODE" == false ]]; then
+        _fname="${URL##*/}"; _fname="${_fname%%\?*}"
+        case "$_fname" in *.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.zip) ARCHIVE_MODE=true ;; esac
+      fi
     else
       github_resolve_slug "$ALT_URL"
     fi
@@ -1621,6 +1632,12 @@ if [[ "$URL" =~ ^https?:// ]]; then
       _fname="${URL##*/}"; _fname="${_fname%%\?*}"
       case "$_fname" in *.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.zip) ARCHIVE_MODE=true ;; esac
     fi
+  fi
+elif [[ "$URL" =~ ^file:// ]]; then
+  ok "URL:   ${URL}"
+  if [[ "$ARCHIVE_MODE" == false ]]; then
+    _fname="${URL##*/}"; _fname="${_fname%%\?*}"
+    case "$_fname" in *.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.zip) ARCHIVE_MODE=true ;; esac
   fi
 elif [[ -n "$URL" ]]; then
   github_resolve_slug "$URL"
